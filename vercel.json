@@ -1,0 +1,21 @@
+{
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/cron/monitor",
+      "schedule": "0 * * * *"
+    }
+  ],
+  "functions": {
+    "src/app/api/run-check/route.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    },
+    "src/app/api/cron/monitor/route.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  }
+}
