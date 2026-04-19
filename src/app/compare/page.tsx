@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
+import { summarizeChange, toneClass } from '@/lib/change-intel';
 
 interface OfferInfo {
   mrp: number | null;
@@ -62,26 +63,11 @@ interface ChangeRecord {
   asin_or_sku: string;
   platform: string;
   is_own: boolean;
+  pool_id: number | null;
+  pool_name: string | null;
   product_title: string | null;
   title_known: string | null;
 }
-
-const FIELD_LABELS: Record<string, string> = {
-  title: '📝 Title',
-  description: '📄 Description',
-  price: '💰 Price',
-  rating: '⭐ Rating',
-  reviewCount: '💬 Reviews',
-  newReviews: '🆕 New Review',
-  'offers.mrp': '🏷️ MRP',
-  'offers.discount': '🔻 Discount',
-  'offers.deal': '🔥 Deal Badge',
-  'offers.coupon': '🎟️ Coupon',
-  'offers.bankOffers': '🏦 Bank Offers',
-  'offers.availability': '📦 Availability',
-  'offers.seller': '🏪 Seller',
-  'offers.bsr': '📊 BSR',
-};
 
 export default function ComparePage() {
   const [pools, setPools] = useState<Pool[]>([]);
@@ -230,24 +216,25 @@ export default function ComparePage() {
 
   if (loading) {
     return (
-      <main className="min-h-screen bg-gray-950 text-gray-100 p-6">
-        <p className="text-gray-400">Loading…</p>
+      <main className="min-h-screen p-6 md:p-8">
+        <p className="text-slate-400">Loading...</p>
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-gray-950 text-gray-100 p-6">
-      <div className="max-w-7xl mx-auto">
+    <main className="min-h-screen p-6 md:p-8">
+      <div className="max-w-310 mx-auto">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">⚔️ Competitor Pools</h1>
-            <p className="text-gray-400 mt-1">Compare your products against competitors side by side</p>
+            <p className="kicker mb-2">Side by Side</p>
+            <h1 className="text-4xl md:text-5xl font-normal tracking-tight text-slate-100">Competitor Pools</h1>
+            <p className="text-slate-400 mt-1 text-sm md:text-base">Quietly observe price, rating, and offer movement across rival listings.</p>
           </div>
           <Link
             href="/"
-            className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm font-medium transition"
+            className="px-4 py-2 rounded-xl text-sm font-medium transition border border-slate-600/70 bg-slate-800/70 hover:bg-slate-700/80 text-slate-100"
           >
             ← Dashboard
           </Link>
@@ -259,11 +246,11 @@ export default function ComparePage() {
             value={newPoolName}
             onChange={(e) => setNewPoolName(e.target.value)}
             placeholder="New pool name (e.g. Class 9 Math Books)"
-            className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-sm"
+            className="flex-1 bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2 text-sm"
           />
           <button
             type="submit"
-            className="px-5 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition"
+            className="px-5 py-2 bg-cyan-500/90 hover:bg-cyan-400 text-slate-950 rounded-xl text-sm font-semibold transition"
           >
             Create Pool
           </button>
@@ -284,9 +271,9 @@ export default function ComparePage() {
           const ownSnap = ownProduct?.snapshot?.payload_json;
 
           return (
-            <div key={pool.id} className="mb-10 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
+            <div key={pool.id} className="mb-10 bg-slate-900/65 rounded-2xl border border-slate-700/60 overflow-hidden backdrop-blur-sm shadow-xl shadow-black/10">
               {/* Pool header */}
-              <div className="flex items-center justify-between p-4 border-b border-gray-800">
+              <div className="flex items-center justify-between p-4 border-b border-slate-700/60">
                 <h2 className="text-lg font-semibold">{pool.name}</h2>
                 <div className="flex gap-2">
                   <button
@@ -294,11 +281,11 @@ export default function ComparePage() {
                     disabled={checking === pool.id}
                     className={`px-3 py-1 rounded text-xs font-medium transition ${
                       checking === pool.id
-                        ? 'bg-emerald-600/40 text-emerald-200 animate-pulse'
-                        : 'bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300'
+                        ? 'bg-emerald-500/25 text-emerald-100 border border-emerald-500/35 animate-pulse'
+                        : 'bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-200'
                     }`}
                   >
-                    {checking === pool.id ? '⏳ Checking…' : '🔄 Check Now'}
+                    {checking === pool.id ? 'Checking...' : 'Check Now'}
                   </button>
                   <button
                     onClick={() => {
@@ -306,11 +293,11 @@ export default function ComparePage() {
                     }}
                     className={`px-3 py-1 rounded text-xs font-medium transition ${
                       expandedPool === pool.id
-                        ? 'bg-amber-600/40 text-amber-200'
-                        : 'bg-amber-600/20 hover:bg-amber-600/40 text-amber-300'
+                        ? 'bg-amber-500/25 text-amber-100 border border-amber-500/35'
+                        : 'bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-200'
                     }`}
                   >
-                    📋 Change Log
+                    Change Log
                   </button>
                   <button
                     onClick={() => {
@@ -318,7 +305,7 @@ export default function ComparePage() {
                       setAssignProductId(null);
                       setAssignIsOwn(false);
                     }}
-                    className="px-3 py-1 bg-blue-600/30 hover:bg-blue-600/50 text-blue-300 rounded text-xs font-medium transition"
+                    className="px-3 py-1 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-100 border border-cyan-500/30 rounded-lg text-xs font-medium transition"
                   >
                     + Add Product
                   </button>
@@ -431,7 +418,7 @@ export default function ComparePage() {
                           </td>
                           <td className="p-3 text-right text-gray-500">—</td>
                           <td className="p-3 text-center font-semibold">
-                            {ownSnap?.rating != null ? `⭐ ${ownSnap.rating}` : '—'}
+                            {ownSnap?.rating != null ? `★ ${ownSnap.rating}` : '—'}
                           </td>
                           <td className="p-3 text-center text-gray-500">—</td>
                           <td className="p-3 text-right">{ownSnap?.reviewCount?.toLocaleString() ?? '—'}</td>
@@ -482,7 +469,7 @@ export default function ComparePage() {
                             </td>
                             <td className={`p-3 text-right text-xs font-medium ${pd.color}`}>{pd.label}</td>
                             <td className="p-3 text-center">
-                              {snap?.rating != null ? `⭐ ${snap.rating}` : '—'}
+                              {snap?.rating != null ? `★ ${snap.rating}` : '—'}
                             </td>
                             <td className={`p-3 text-center text-xs font-medium ${rd.color}`}>{rd.label}</td>
                             <td className="p-3 text-right">{snap?.reviewCount?.toLocaleString() ?? '—'}</td>
@@ -558,7 +545,7 @@ export default function ComparePage() {
                   {products.some((p) => p.snapshot?.payload_json?.offers) && (
                     <div className="border-t border-gray-800">
                       <div className="p-3 bg-gray-800/20">
-                        <h3 className="text-sm font-semibold text-gray-300 mb-3">🏷️ Offers & Deal Comparison</h3>
+                        <h3 className="text-sm font-semibold text-gray-300 mb-3 tracking-wide">Offers &amp; Deals</h3>
                         <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(${products.length}, 1fr)` }}>
                           {products.map((prod) => {
                             const snap = prod.snapshot?.payload_json;
@@ -573,8 +560,8 @@ export default function ComparePage() {
                                   <div className="space-y-1.5">
                                     {o.mrp && <div><span className="text-gray-500">MRP:</span> <span className="line-through text-gray-400">₹{o.mrp}</span></div>}
                                     {o.discountPct && <div><span className="text-gray-500">Discount:</span> <span className="text-green-400 font-semibold">{o.discountPct}</span></div>}
-                                    {o.dealBadge && <div><span className="px-1.5 py-0.5 bg-red-600/30 text-red-300 rounded text-[10px]">🔥 {o.dealBadge}</span></div>}
-                                    {o.coupon && <div><span className="px-1.5 py-0.5 bg-green-600/30 text-green-300 rounded text-[10px]">🎟️ {o.coupon}</span></div>}
+                                    {o.dealBadge && <div><span className="px-1.5 py-0.5 bg-red-600/30 text-red-300 rounded text-[10px] uppercase tracking-wider">{o.dealBadge}</span></div>}
+                                    {o.coupon && <div><span className="px-1.5 py-0.5 bg-green-600/30 text-green-300 rounded text-[10px] uppercase tracking-wider">{o.coupon}</span></div>}
                                     {o.bankOffers?.length > 0 && <div><span className="text-gray-500">Bank:</span> <span className="text-gray-300">{o.bankOffers.length} offer{o.bankOffers.length > 1 ? 's' : ''}</span></div>}
                                     {o.availability && <div><span className="text-gray-500">Stock:</span> <span className={o.availability.toLowerCase().includes('in stock') ? 'text-green-400' : 'text-yellow-400'}>{o.availability}</span></div>}
                                     {o.seller && <div><span className="text-gray-500">Seller:</span> <span className="text-gray-300">{o.seller}</span></div>}
@@ -598,7 +585,7 @@ export default function ComparePage() {
                 <div className="border-t border-gray-800 bg-gray-900/50">
                   <div className="p-4">
                     <div className="flex items-center justify-between mb-4">
-                      <h3 className="text-sm font-semibold text-gray-300">📋 Change Log — Listing Monitoring</h3>
+                      <h3 className="text-sm font-semibold text-gray-300 tracking-wide">Change Log</h3>
                       <div className="flex gap-1">
                         {(['1h', '6h', '24h', '7d', '30d', 'all'] as const).map((period) => (
                           <button
@@ -635,12 +622,15 @@ export default function ComparePage() {
                       }
 
                       return (
-                        <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2">
+                        <div className="space-y-4 max-h-125 overflow-y-auto pr-2">
                           {Object.entries(grouped).map(([day, dayChanges]) => (
                             <div key={day}>
                               <p className="text-xs text-gray-500 font-medium mb-2 sticky top-0 bg-gray-900/90 py-1">{day}</p>
                               <div className="space-y-1.5">
                                 {dayChanges.map((c) => (
+                                  (() => {
+                                    const insight = summarizeChange(c);
+                                    return (
                                   <div
                                     key={c.id}
                                     className={`flex items-start gap-3 p-2.5 rounded-lg text-xs ${
@@ -659,15 +649,18 @@ export default function ComparePage() {
                                       <p className="text-gray-300 font-medium truncate">
                                         {c.product_title || c.title_known || c.asin_or_sku}
                                       </p>
-                                      <p className="mt-0.5">
-                                        <span className="text-gray-400">{FIELD_LABELS[c.field] || c.field}:</span>
-                                        {c.old_value && (
-                                          <span className="text-red-400 line-through ml-1">{c.old_value.substring(0, 80)}</span>
-                                        )}
-                                        <span className="text-green-400 ml-1">{c.new_value.substring(0, 80)}</span>
+                                      <p className="mt-0.5 flex items-center gap-2 flex-wrap">
+                                        <span className={`font-semibold ${toneClass(insight.tone)}`}>{insight.label}</span>
+                                        <span className="text-gray-500 uppercase text-[10px] tracking-wide">{insight.category}</span>
+                                      </p>
+                                      <p className="text-gray-300 mt-0.5">{insight.summary}</p>
+                                      <p className="text-gray-500 mt-0.5 text-[10px]">
+                                        field: {c.field}
                                       </p>
                                     </div>
                                   </div>
+                                    );
+                                  })()
                                 ))}
                               </div>
                             </div>

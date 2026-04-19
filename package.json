@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "db:migrate": "node src/lib/migrate.mjs",
+    "import:products": "node scripts/import-products.cjs",
     "vercel:env:push": "powershell -ExecutionPolicy Bypass -File scripts/push-vercel-env.ps1"
   },
   "keywords": [],

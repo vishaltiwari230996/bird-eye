@@ -1,19 +1,328 @@
 @import "tailwindcss";
 
+/* ───────────────────────────────────────────────────────────
+   Theme — washi paper · sumi ink · torii vermillion
+   Every Tailwind shade is inverted (light↔dark) so the
+   existing dark-mode classes render as a calm light theme
+   without touching component JSX.
+   ─────────────────────────────────────────────────────────── */
+@theme {
+  --font-sans: var(--font-jakarta), "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-serif: var(--font-serif-display), "Cormorant Garamond", "EB Garamond", "Iowan Old Style", Georgia, serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+
+  /* Neutrals — slate / gray / zinc / stone all share the same washi scale */
+  --color-slate-50:  #0a0907;
+  --color-slate-100: #15130f;
+  --color-slate-200: #24211a;
+  --color-slate-300: #3a3528;
+  --color-slate-400: #555044;
+  --color-slate-500: #847b69;
+  --color-slate-600: #aa9f86;
+  --color-slate-700: #c8bda1;
+  --color-slate-800: #ddd3b6;
+  --color-slate-900: #ece2c9;
+  --color-slate-950: #f4ead2;
+
+  --color-gray-50:  #0a0907;
+  --color-gray-100: #15130f;
+  --color-gray-200: #24211a;
+  --color-gray-300: #3a3528;
+  --color-gray-400: #555044;
+  --color-gray-500: #847b69;
+  --color-gray-600: #aa9f86;
+  --color-gray-700: #c8bda1;
+  --color-gray-800: #ddd3b6;
+  --color-gray-900: #ece2c9;
+  --color-gray-950: #f4ead2;
+
+  --color-zinc-50:  #0a0907;
+  --color-zinc-100: #15130f;
+  --color-zinc-500: #847b69;
+  --color-zinc-700: #c8bda1;
+  --color-zinc-900: #ece2c9;
+  --color-zinc-950: #f4ead2;
+
+  --color-stone-50:  #0a0907;
+  --color-stone-500: #847b69;
+  --color-stone-900: #ece2c9;
+
+  /* Vermillion — torii red (replaces red-*) */
+  --color-red-50:  #4a1410;
+  --color-red-100: #5b1a16;
+  --color-red-200: #6e201b;
+  --color-red-300: #87271f;
+  --color-red-400: #a3322a;
+  --color-red-500: #b73a32;
+  --color-red-600: #c75a52;
+  --color-red-700: #db8a83;
+  --color-red-800: #ecbab4;
+  --color-red-900: #f7dcd8;
+  --color-red-950: #fceeec;
+
+  --color-rose-500: #b73a32;
+  --color-rose-300: #87271f;
+  --color-pink-500: #b73a32;
+
+  /* Matcha — soft moss (replaces emerald / green / lime / teal) */
+  --color-emerald-50:  #1a2c1a;
+  --color-emerald-100: #233823;
+  --color-emerald-200: #2e4a2d;
+  --color-emerald-300: #3a5d39;
+  --color-emerald-400: #4a754a;
+  --color-emerald-500: #5b8a5a;
+  --color-emerald-600: #7ba37a;
+  --color-emerald-700: #a0bda0;
+  --color-emerald-800: #c0d4bf;
+  --color-emerald-900: #dde6dc;
+  --color-emerald-950: #ecf0eb;
+
+  --color-green-50:  #1a2c1a;
+  --color-green-100: #233823;
+  --color-green-200: #2e4a2d;
+  --color-green-300: #3a5d39;
+  --color-green-400: #4a754a;
+  --color-green-500: #5b8a5a;
+  --color-green-600: #7ba37a;
+  --color-green-700: #a0bda0;
+  --color-green-800: #c0d4bf;
+  --color-green-900: #dde6dc;
+  --color-green-950: #ecf0eb;
+
+  --color-teal-300: #3a5d39;
+  --color-teal-500: #5b8a5a;
+  --color-lime-500: #5b8a5a;
+
+  /* Ai indigo — quiet blue (replaces cyan / sky / blue / indigo / violet) */
+  --color-cyan-50:  #131e2c;
+  --color-cyan-100: #1a2738;
+  --color-cyan-200: #213049;
+  --color-cyan-300: #2c4061;
+  --color-cyan-400: #3a5380;
+  --color-cyan-500: #466ba0;
+  --color-cyan-600: #6485b5;
+  --color-cyan-700: #8ba6c9;
+  --color-cyan-800: #b3c4dc;
+  --color-cyan-900: #d3deec;
+  --color-cyan-950: #e6edf5;
+
+  --color-sky-300: #2c4061;
+  --color-sky-500: #466ba0;
+
+  --color-blue-50:  #131e2c;
+  --color-blue-100: #1a2738;
+  --color-blue-200: #213049;
+  --color-blue-300: #2c4061;
+  --color-blue-400: #3a5380;
+  --color-blue-500: #466ba0;
+  --color-blue-600: #6485b5;
+  --color-blue-700: #8ba6c9;
+  --color-blue-800: #b3c4dc;
+  --color-blue-900: #d3deec;
+  --color-blue-950: #e6edf5;
+
+  --color-indigo-50:  #131e2c;
+  --color-indigo-100: #1a2738;
+  --color-indigo-200: #213049;
+  --color-indigo-300: #2c4061;
+  --color-indigo-400: #3a5380;
+  --color-indigo-500: #466ba0;
+  --color-indigo-600: #6485b5;
+  --color-indigo-700: #8ba6c9;
+  --color-indigo-800: #b3c4dc;
+  --color-indigo-900: #d3deec;
+  --color-indigo-950: #e6edf5;
+
+  --color-violet-300: #2c4061;
+  --color-violet-500: #466ba0;
+
+  /* Ochre — warm sumi tan (replaces amber / yellow / orange) */
+  --color-amber-50:  #2c1d08;
+  --color-amber-100: #3a280f;
+  --color-amber-200: #4d3614;
+  --color-amber-300: #66481c;
+  --color-amber-400: #855e26;
+  --color-amber-500: #a87a35;
+  --color-amber-600: #c0934c;
+  --color-amber-700: #d2ad6e;
+  --color-amber-800: #e2c694;
+  --color-amber-900: #ecd9b8;
+  --color-amber-950: #f3e6cf;
+
+  --color-yellow-50:  #2c1d08;
+  --color-yellow-100: #3a280f;
+  --color-yellow-200: #4d3614;
+  --color-yellow-300: #66481c;
+  --color-yellow-400: #855e26;
+  --color-yellow-500: #a87a35;
+  --color-yellow-600: #c0934c;
+  --color-yellow-700: #d2ad6e;
+  --color-yellow-800: #e2c694;
+  --color-yellow-900: #ecd9b8;
+  --color-yellow-950: #f3e6cf;
+
+  --color-orange-50:  #2c1d08;
+  --color-orange-100: #3a280f;
+  --color-orange-200: #4d3614;
+  --color-orange-300: #66481c;
+  --color-orange-400: #855e26;
+  --color-orange-500: #a87a35;
+  --color-orange-600: #c0934c;
+  --color-orange-700: #d2ad6e;
+  --color-orange-800: #e2c694;
+  --color-orange-900: #ecd9b8;
+  --color-orange-950: #f3e6cf;
+
+  /* Aubergine — quiet purple */
+  --color-purple-50:  #2a1f37;
+  --color-purple-100: #382949;
+  --color-purple-200: #46355c;
+  --color-purple-300: #564373;
+  --color-purple-400: #6c5689;
+  --color-purple-500: #8270a0;
+  --color-purple-600: #9c8db5;
+  --color-purple-700: #b8aecb;
+  --color-purple-800: #d2cbde;
+  --color-purple-900: #e5e0ed;
+  --color-purple-950: #efebf3;
+
+  --color-fuchsia-500: #8270a0;
+  --color-pink-300: #87271f;
+}
+
 :root {
-  --foreground: #171717;
-  --background: #ffffff;
+  --foreground: #1a1814;
+  --background: #f3ead4;
+  --paper: #f6efde;
+  --paper-soft: #fbf6e8;
+  --ink: #1a1814;
+  --ink-soft: #4a4438;
+  --hair: rgba(58, 53, 40, 0.14);
+  --hair-strong: rgba(58, 53, 40, 0.22);
+  --vermillion: #b7322c;
+  --vermillion-soft: rgba(183, 50, 44, 0.08);
+  --ai-indigo: #2c4061;
+  --matcha: #5b8a5a;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --foreground: #ededed;
-    --background: #0a0a0a;
+    --foreground: #1a1814;
+    --background: #f3ead4;
   }
 }
 
-body {
-  color: var(--foreground);
+html, body {
   background: var(--background);
-  font-family: system-ui, -apple-system, sans-serif;
+  color: var(--ink);
+}
+
+.app-shell {
+  color: var(--ink);
+  background: var(--background);
+  font-family: var(--font-jakarta), "Inter", "Segoe UI", sans-serif;
+  min-height: 100vh;
+  font-feature-settings: "ss01", "cv11", "liga";
+  letter-spacing: 0.005em;
+  position: relative;
+
+  background-image:
+    radial-gradient(900px 560px at 8% -8%, rgba(183, 50, 44, 0.06), transparent 55%),
+    radial-gradient(1100px 700px at 92% -20%, rgba(44, 64, 97, 0.05), transparent 55%),
+    linear-gradient(180deg, #f6efde 0%, #f3ead4 55%, #efe6cc 100%);
+}
+
+/* A single hairline of vermillion across the very top — a quiet Shinto cue. */
+.app-shell::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--vermillion) 22%, var(--vermillion) 78%, transparent);
+  opacity: 0.55;
+  pointer-events: none;
+  z-index: 50;
+}
+
+h1, h2, .serif {
+  font-family: var(--font-serif-display), "Cormorant Garamond", "EB Garamond", Georgia, serif;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.font-mono, code, pre {
+  font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/* Soften every Tailwind border-radius — minimalism prefers gentle, not pillowy. */
+.rounded-xl  { border-radius: 4px !important; }
+.rounded-2xl { border-radius: 6px !important; }
+.rounded-lg  { border-radius: 3px !important; }
+.rounded-md  { border-radius: 2px !important; }
+.rounded     { border-radius: 2px !important; }
+
+/* Strip the heavy drop-shadows the dark theme used. */
+.shadow-xl, .shadow-lg, .shadow-md,
+[class*="shadow-black"] {
+  box-shadow: none !important;
+}
+
+.backdrop-blur-sm, .backdrop-blur { backdrop-filter: none !important; }
+
+::selection {
+  background: rgba(183, 50, 44, 0.18);
+  color: var(--ink);
+}
+
+* {
+  scrollbar-color: rgba(58, 53, 40, 0.32) transparent;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(58, 53, 40, 0.28); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(58, 53, 40, 0.42); }
+::-webkit-scrollbar-track { background: transparent; }
+
+input, select, textarea {
+  background: var(--paper-soft) !important;
+  border-color: var(--hair-strong) !important;
+  color: var(--ink) !important;
+  font-family: inherit;
+}
+
+input::placeholder, textarea::placeholder {
+  color: rgba(74, 68, 56, 0.5);
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--vermillion) !important;
+  box-shadow: 0 0 0 1px rgba(183, 50, 44, 0.18);
+}
+
+button { font-family: inherit; letter-spacing: 0.01em; }
+
+a { text-decoration: none; }
+
+.kicker {
+  font-size: 0.68rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.divider-torii {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--ink-soft);
+}
+.divider-torii::before,
+.divider-torii::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--hair-strong);
 }

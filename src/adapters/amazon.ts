@@ -153,6 +153,63 @@ const SELECTOR_STRATEGIES: SelectorSet[] = [
   },
 ];
 
+function parseCountText(raw: string): number | null {
+  const text = (raw || '').trim();
+  if (!text) return null;
+
+  const ratingsMatch = text.match(/([\d,]+)\s*(?:global\s+)?ratings?/i);
+  if (ratingsMatch?.[1]) {
+    const n = parseInt(ratingsMatch[1].replace(/,/g, ''), 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  const reviewsMatch = text.match(/([\d,]+)\s*reviews?/i);
+  if (reviewsMatch?.[1]) {
+    const n = parseInt(reviewsMatch[1].replace(/,/g, ''), 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Last-resort fallback for formats like "(25)"
+  const generic = text.match(/([\d,]+)/);
+  if (generic?.[1] && /rating|review|\(\d/.test(text.toLowerCase())) {
+    const n = parseInt(generic[1].replace(/,/g, ''), 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  return null;
+}
+
+function extractPrimaryAmazonReviewCount($: cheerio.CheerioAPI): number | null {
+  const strictSelectors = [
+    '#acrCustomerReviewText',
+    '#acrCustomerReviewLink #acrCustomerReviewText',
+    '#averageCustomerReviews #acrCustomerReviewText',
+    '#reviews-medley-footer .a-text-bold',
+    '[data-hook="total-review-count"]',
+  ];
+
+  for (const selector of strictSelectors) {
+    const txt = $(selector).first().text().trim();
+    const count = parseCountText(txt);
+    if (count != null) return count;
+  }
+
+  const blockedAncestors =
+    '#desktop-dp-sims_session-similarities, #sims-consolidated-2_feature_div, #sp_detail, #bundleV2_feature_div, #p13n-desktop-sims-fbt, #similarities_feature_div, #purchase-sims-feature, #unifiedLocation1_feature_div';
+
+  const candidates: number[] = [];
+  $('#ppd #acrCustomerReviewText, #centerCol #acrCustomerReviewText, #ppd [data-hook="total-review-count"], #centerCol [data-hook="total-review-count"]').each((_i, el) => {
+    const node = $(el);
+    if (node.closest(blockedAncestors).length > 0) return;
+    const c = parseCountText(node.text());
+    if (c != null) candidates.push(c);
+  });
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b - a);
+  return candidates[0];
+}
+
 function extractJsonLd(html: string): Partial<NormalizedPayload> | null {
   try {
     const $ = cheerio.load(html);
@@ -172,7 +229,7 @@ function extractJsonLd(html: string): Partial<NormalizedPayload> | null {
             ? parseFloat(product.aggregateRating.ratingValue)
             : null,
           reviewCount: product.aggregateRating?.reviewCount
-            ? parseInt(product.aggregateRating.reviewCount, 10)
+            ? parseCountText(String(product.aggregateRating.reviewCount))
             : null,
         };
       }
@@ -187,22 +244,22 @@ function parseWithCheerio(
 ): { payload: Partial<NormalizedPayload>; success: boolean } {
   const $ = cheerio.load(html);
   const title = $(selectors.title).first().text().trim();
-  let priceRaw = $(selectors.price).first().text().trim();
+  let priceRaw = extractPrimaryAmazonPrice($) || $(selectors.price).first().text().trim();
   // Fallback: if .a-offscreen is empty, try .a-price-whole
   if (!priceRaw) {
-    priceRaw = $('.a-price-whole').first().text().trim();
+    priceRaw =
+      $('#corePriceDisplay_desktop_feature_div .a-price-whole, #corePrice_feature_div .a-price-whole, #ppd .a-price-whole')
+        .first()
+        .text()
+        .trim() || $('.a-price-whole').first().text().trim();
   }
   const ratingRaw = $(selectors.rating).first().text().trim();
-  let rcRaw = $(selectors.reviewCount).first().text().trim();
-  // Sometimes review count is in parentheses like "(6)"
-  if (!rcRaw) {
-    rcRaw = $('[data-hook="total-review-count"]').first().text().trim();
-  }
   const desc = $(selectors.description).first().text().trim();
 
   const price = parseFloat(priceRaw.replace(/[^0-9.]/g, '')) || 0;
   const rating = parseFloat(ratingRaw) || null;
-  const reviewCount = parseInt(rcRaw.replace(/[^0-9]/g, ''), 10) || null;
+  const selectorCount = parseCountText($(selectors.reviewCount).first().text().trim());
+  const reviewCount = extractPrimaryAmazonReviewCount($) ?? selectorCount ?? null;
 
   // Extract review snippets from the page
   const reviews: ReviewSnippet[] = [];
@@ -225,6 +282,65 @@ function parseWithCheerio(
     payload: { title, description: desc, price, currency: 'INR', rating, reviewCount, reviews, offers, seo },
     success,
   };
+}
+
+function parsePriceValue(raw: string): number | null {
+  if (!raw) return null;
+  const value = parseFloat(raw.replace(/[^0-9.]/g, ''));
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Extract the main PDP price and avoid unrelated sections like FBT/recommendations.
+ */
+function extractPrimaryAmazonPrice($: cheerio.CheerioAPI): string {
+  const strictSelectors = [
+    '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
+    '#corePrice_feature_div .a-price .a-offscreen',
+    '#corePrice_desktop .a-price .a-offscreen',
+    '#apex_desktop .a-price .a-offscreen',
+    '#tp_price_block_total_price_ww .a-offscreen',
+    '#priceblock_ourprice',
+    '#priceblock_dealprice',
+    '#priceblock_saleprice',
+    '#price_inside_buybox',
+  ];
+
+  for (const selector of strictSelectors) {
+    const text = $(selector).first().text().trim();
+    if (parsePriceValue(text)) return text;
+  }
+
+  const blockedAncestors =
+    '#desktop-dp-sims_session-similarities, #sims-consolidated-2_feature_div, #sp_detail, #bundleV2_feature_div, #p13n-desktop-sims-fbt, #similarities_feature_div, #purchase-sims-feature, #unifiedLocation1_feature_div';
+
+  const candidates: Array<{ text: string; score: number }> = [];
+
+  $('.a-price .a-offscreen, .a-color-price').each((_i, el) => {
+    const node = $(el);
+    if (node.closest(blockedAncestors).length > 0) return;
+
+    const priceSpan = node.closest('span.a-price');
+    if (priceSpan.attr('data-a-strike') === 'true') return;
+    if (priceSpan.hasClass('a-text-price') || node.closest('.a-text-price').length > 0) return;
+
+    const text = node.text().trim();
+    const parsed = parsePriceValue(text);
+    if (!parsed) return;
+
+    let score = 10;
+    if (node.closest('#corePriceDisplay_desktop_feature_div, #corePrice_feature_div, #corePrice_desktop').length > 0) score = 100;
+    else if (node.closest('#apex_desktop, #tp_price_block_total_price_ww').length > 0) score = 80;
+    else if (node.closest('#ppd, #centerCol').length > 0) score = 50;
+
+    candidates.push({ text, score });
+  });
+
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0].text;
+  }
+  return '';
 }
 
 /** Extract offers, deals, coupons, bank offers, seller info from Amazon product page */
@@ -279,6 +395,38 @@ function extractOffers($: cheerio.CheerioAPI): OfferInfo {
 
 /** Extract SEO-relevant data from Amazon product page */
 function extractSeo($: cheerio.CheerioAPI, html: string): SeoInfo {
+  const normalizeBullet = (txt: string): string => txt.replace(/\s+/g, ' ').trim();
+
+  const isUsefulBullet = (txt: string): boolean => {
+    const t = txt.toLowerCase();
+    if (!t) return false;
+    if (t.includes('make sure this fits')) return false;
+    if (t.includes('report an issue with this product')) return false;
+    if (t.includes('would you like to tell us about a lower price')) return false;
+    if (t.length < 12) return false;
+    return true;
+  };
+
+  const deriveBulletsFromText = (text: string): string[] => {
+    if (!text) return [];
+    const chunks = text
+      .split(/[\n\r•]+/)
+      .map(normalizeBullet)
+      .filter((x) => x.length >= 14 && x.length <= 260);
+
+    if (chunks.length >= 2) {
+      return chunks.filter(isUsefulBullet).slice(0, 10);
+    }
+
+    // Last fallback: split long paragraph by sentence boundaries.
+    return text
+      .split(/\.(?:\s+|$)/)
+      .map(normalizeBullet)
+      .filter((x) => x.length >= 20 && x.length <= 220)
+      .filter(isUsefulBullet)
+      .slice(0, 8);
+  };
+
   // Meta title
   const metaTitle = $('title').first().text().trim() || null;
 
@@ -287,12 +435,36 @@ function extractSeo($: cheerio.CheerioAPI, html: string): SeoInfo {
 
   // Bullet points (feature list)
   const bullets: string[] = [];
-  $('#feature-bullets ul li span.a-list-item, #feature-bullets ul li').each((_i, el) => {
-    const txt = $(el).text().trim();
-    if (txt && !txt.includes('Make sure this fits') && bullets.length < 10) {
-      bullets.push(txt);
-    }
-  });
+
+  const bulletSelectors = [
+    '#feature-bullets ul li span.a-list-item',
+    '#feature-bullets ul li',
+    '#featurebullets_feature_div ul li span.a-list-item',
+    '#featurebullets_feature_div ul li',
+    '#bookDescription_feature_div li',
+    '#bookDescription_feature_div .a-expander-content',
+    '#productDescription li',
+    '#productDescription_feature_div li',
+    '#detailBullets_feature_div li span.a-list-item',
+    '#detailBulletsWrapper_feature_div li span.a-list-item',
+  ];
+
+  for (const selector of bulletSelectors) {
+    $(selector).each((_i, el) => {
+      if (bullets.length >= 12) return false;
+      const txt = normalizeBullet($(el).text());
+      if (isUsefulBullet(txt)) bullets.push(txt);
+    });
+    if (bullets.length >= 5) break;
+  }
+
+  if (bullets.length === 0) {
+    const descriptionBlob = normalizeBullet(
+      $('#bookDescription_feature_div, #productDescription_feature_div, #productDescription').text(),
+    );
+    bullets.push(...deriveBulletsFromText(descriptionBlob));
+  }
+
   // Deduplicate (nested spans can duplicate text)
   const uniqueBullets = [...new Set(bullets)];
 

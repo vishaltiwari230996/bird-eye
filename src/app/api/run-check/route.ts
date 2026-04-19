@@ -5,7 +5,8 @@ import { consumeToken, politeDelay } from '@/lib/rate-limit';
 import { processSnapshot } from '@/lib/differ';
 import { notifyChanges } from '@/lib/notify';
 import { getAdapter } from '@/adapters';
-import type { Product } from '@/adapters/types';
+import { assessPayloadQuality } from '@/lib/scrape-quality';
+import type { NormalizedPayload, Product } from '@/adapters/types';
 
 const BATCH_SIZE = 10;
 const CONCURRENCY = 4;
@@ -52,11 +53,11 @@ export async function POST(req: NextRequest) {
   const referer = req.headers.get('referer') || '';
   const host = req.headers.get('host') || 'localhost';
   const isSameOrigin =
-    origin.includes(host) ||
-    referer.includes(host) ||
-    (!origin && !referer); // e.g. local dev curl
+    (!!origin && origin.includes(host)) ||
+    (!!referer && referer.includes(host));
+  const allowUnauthedLocalDev = process.env.NODE_ENV !== 'production' && !origin && !referer;
 
-  if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET && !isSameOrigin) {
+  if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET && !isSameOrigin && !allowUnauthedLocalDev) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
@@ -118,7 +119,52 @@ export async function POST(req: NextRequest) {
       await politeDelay();
 
       const adapter = getAdapter(product.platform);
-      const fetchResult = await withRetry(() => adapter.fetch(product));
+      const prevSnap = await query<{ payload_json: NormalizedPayload }>(
+        'SELECT payload_json FROM snapshots WHERE product_id = $1 ORDER BY fetched_at DESC LIMIT 1',
+        [product.id],
+      );
+      const prevPayload = prevSnap[0]?.payload_json ?? null;
+
+      let fetchResult = await withRetry(() => adapter.fetch(product));
+      let quality = assessPayloadQuality({ product, fetchResult, prevPayload });
+
+      // One extra fetch attempt when the first payload looks suspicious.
+      if (!quality.accepted) {
+        log.warn('Low confidence scrape payload, retrying once', {
+          productId: product.id,
+          platform: product.platform,
+          confidence: quality.confidence as any,
+          reasons: quality.reasons.join(',') as any,
+          strategy: fetchResult.strategy,
+          fallbackLevel: fetchResult.fallbackLevel as any,
+        });
+        await politeDelay();
+        const second = await withRetry(() => adapter.fetch(product), 1);
+        const secondQuality = assessPayloadQuality({ product, fetchResult: second, prevPayload });
+        if (secondQuality.confidence >= quality.confidence) {
+          fetchResult = second;
+          quality = secondQuality;
+        }
+      }
+
+      if (!quality.accepted) {
+        results.push({
+          productId: product.id,
+          status: 'low_confidence',
+          changes: 0,
+          strategy: fetchResult.strategy,
+          fallbackLevel: fetchResult.fallbackLevel,
+          durationMs: fetchResult.durationMs,
+          error: `confidence=${quality.confidence}; reasons=${quality.reasons.join(',')}`,
+        });
+        log.warn('Rejected scrape payload (not persisted)', {
+          productId: product.id,
+          platform: product.platform,
+          confidence: quality.confidence as any,
+          reasons: quality.reasons.join(',') as any,
+        });
+        return;
+      }
 
       if (fetchResult.fallbackLevel > 0) {
         log.warn('Parse drift detected', {
