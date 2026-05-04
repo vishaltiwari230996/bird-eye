@@ -1,4 +1,4 @@
-"""scraper.py — Amazon product page + offer listing scraper.
+﻿"""scraper.py — Amazon product page + offer listing scraper.
 
 Expert-grade anti-detection rewrite:
   * Large, weighted UA pool (Chrome 131/132 real UAs)
@@ -274,9 +274,19 @@ def human_delay(min_s: float = 0.8, max_s: float = 2.4) -> float:
 
 
 def parse_price(raw: str) -> Optional[float]:
-    raw = re.sub(r"[^\d.,]", "", raw.replace(",", ""))
-    m = re.search(r"\d+(?:\.\d+)?", raw)
-    return float(m.group()) if m else None
+    """Extract the first valid INR price from a string. Caps decimals at 2
+    so concatenated prices like '527.002222527' don't get parsed as one number.
+    """
+    if not raw:
+        return None
+    # Match an Indian-format number (with optional comma grouping) and ≤2 decimals
+    m = re.search(r"\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?", raw)
+    if not m:
+        return None
+    try:
+        return float(m.group().replace(",", ""))
+    except Exception:
+        return None
 
 
 def is_blocked(html: str) -> bool:
@@ -410,7 +420,7 @@ async def fetch_sellers_paapi(asin: str) -> list[dict]:
             )
 
         if r.status_code != 200:
-            print(f"[paapi] {asin} → HTTP {r.status_code}: {r.text[:300]}")
+            print(f"[paapi] {asin} -> HTTP {r.status_code}: {r.text[:300]}")
             return []
 
         data = r.json()
@@ -432,7 +442,7 @@ async def fetch_sellers_paapi(asin: str) -> list[dict]:
                     "prime_eligible": is_prime,
                 })
 
-        print(f"[paapi] {asin} → {len(listings)} offers via PA API")
+        print(f"[paapi] {asin} -> {len(listings)} offers via PA API")
         return listings
 
     except Exception as e:
@@ -563,37 +573,6 @@ async def ai_extract_offers(html: str, asin: str) -> list[dict]:
     except Exception as e:
         print(f"[ai_extract] Offer extraction failed for {asin}: {e}")
     return []
-
-
-    """Detect all known Amazon bot/CAPTCHA/redirect block patterns."""
-    if not html or len(html) < 500:
-        return True
-    soup = BeautifulSoup(html, "html.parser")
-    title = (soup.title.string or "").strip() if soup.title else ""
-    low_title = title.lower()
-    low_html = html.lower()
-
-    if low_title in ("amazon.in", "amazon.com", "", "access denied", "service unavailable"):
-        return True
-
-    if any(kw in low_html for kw in (
-        "type the characters you see",
-        "enter the characters you see",
-        "robot check",
-        "/errors/validatecaptcha",
-        "captcha",
-        "ap_captcha",
-        "recaptcha",
-    )):
-        return True
-
-    if any(kw in low_title for kw in ("robot", "captcha", "denied", "unavailable", "error")):
-        return True
-
-    if len(soup.get_text(strip=True)) < 200:
-        return True
-
-    return False
 
 
 def build_static_headers(ua: str, referer: str = "") -> dict:
@@ -778,69 +757,191 @@ def parse_aod_html(html: str) -> list[dict]:
     listings: list[dict] = []
     seen_keys: set[str] = set()
 
-    for sb in soup.find_all(id="aod-offer-soldBy"):
-        a = sb.find("a")
-        if not a:
-            continue
-        seller_name = a.get_text(strip=True)
-        if not seller_name:
-            continue
-        href = a.get("href", "") or ""
+    # ── Strategy A: AOD popup / offer-listing markup (preferred) ──────────────
+    # Each offer has #aod-offer-soldBy with seller link inside, sitting in
+    # an ancestor #aod-pinned-offer or id starting with aod-offer-{n}.
+    sold_by_blocks = soup.find_all(id="aod-offer-soldBy")
+    if sold_by_blocks:
+        for sb in sold_by_blocks:
+            a = sb.find("a")
+            if not a:
+                continue
+            seller_name = a.get_text(strip=True)
+            if not seller_name:
+                continue
+            href = a.get("href", "") or ""
+            sid_m = re.search(r"seller=([A-Z0-9]+)", href, re.I)
+            seller_id = sid_m.group(1) if sid_m else ""
 
-        container = sb
-        for _ in range(12):
-            if container.parent is None:
-                break
-            container = container.parent
-            cid = container.get("id", "") or ""
-            classes = container.get("class") or []
-            if (
-                cid in ("aod-pinned-offer",)
-                or cid.startswith("aod-offer-")
-                or "aod-offer" in classes
-                or "aod-pinned-offer" in classes
-                or "aod-offer-list-item" in classes
-            ):
-                break
-
-        price = None
-        for off in container.find_all("span", class_="a-offscreen"):
-            txt = off.get_text(strip=True)
-            if "₹" in txt or "Rs" in txt or "INR" in txt:
-                price = parse_price(txt)
-                if price is not None:
+            container = sb
+            for _ in range(15):
+                if container.parent is None:
+                    break
+                container = container.parent
+                cid = container.get("id", "") or ""
+                classes = container.get("class") or []
+                if (
+                    cid == "aod-pinned-offer"
+                    or (cid.startswith("aod-offer-") and cid != "aod-offer-soldBy")
+                    or "aod-offer" in classes
+                    or "aod-pinned-offer" in classes
+                    or "aod-offer-list-item" in classes
+                ):
                     break
 
-        if price is None:
-            for span in container.find_all("span"):
-                txt = span.get_text(strip=True)
-                if "₹" in txt and re.search(r"\d", txt):
-                    price = parse_price(txt)
-                    if price is not None:
+            price = None
+            for off in container.find_all("span", class_="a-offscreen"):
+                ancestor_classes = " ".join(
+                    " ".join(p.get("class") or []) for p in off.parents if p.name
+                )
+                if "a-text-strike" in ancestor_classes or "a-text-price" in ancestor_classes:
+                    continue
+                txt = off.get_text(strip=True)
+                if "₹" in txt or "Rs" in txt or "INR" in txt or re.search(r"\d{2,}", txt):
+                    p = parse_price(txt)
+                    if p and p > 0:
+                        price = p
                         break
+            if price is None:
+                for span in container.find_all("span"):
+                    txt = span.get_text(strip=True)
+                    if "₹" in txt and re.search(r"\d", txt):
+                        p = parse_price(txt)
+                        if p and p > 0:
+                            price = p
+                            break
 
-        block_html = str(container).lower()
-        is_fba = (
-            "isamazonfulfilled=1" in href.lower()
-            or "fulfilled by amazon" in block_html
-            or container.find(class_=re.compile(r"a-icon-prime", re.I)) is not None
-        )
-        is_prime = container.find(class_=re.compile(r"a-icon-prime", re.I)) is not None
+            block_html = str(container).lower()
+            is_fba = (
+                "isamazonfulfilled=1" in href.lower()
+                or "fulfilled by amazon" in block_html
+                or "amazon fulfilled" in block_html
+            )
+            is_prime = container.find(class_=re.compile(r"a-icon-prime", re.I)) is not None
 
-        sid_m = re.search(r"seller=([A-Z0-9]+)", href, re.I)
-        seller_id = sid_m.group(1) if sid_m else ""
-        key = f"{seller_id or seller_name}|{price}"
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
+            key = f"{seller_id or seller_name}|{price}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
 
-        listings.append({
-            "seller_name": seller_name,
-            "price": price,
-            "condition": "New",
-            "is_fba": is_fba,
-            "prime_eligible": is_prime,
-        })
+            listings.append({
+                "seller_name": seller_name,
+                "price": price,
+                "condition": "New",
+                "is_fba": is_fba,
+                "prime_eligible": is_prime,
+            })
+
+        if listings:
+            return listings
+
+    # ── Strategy B: Modern /gp/offer-listing/ markup (post-2023) ──────────────
+    # Each offer card has a [offer-display-feature-name="desktop-merchant-info"]
+    # The widest sensible offer-card ancestor is #desktop_qualifiedBuyBox or
+    # #offer-display-features (one per offer; siblings hold price + shipping).
+    merchant_blocks = soup.select('[offer-display-feature-name="desktop-merchant-info"]')
+    if merchant_blocks:
+        offer_cards: list[Tag] = []
+        seen_card_ids: set[int] = set()
+        for mi in merchant_blocks:
+            card = mi
+            best = None
+            for _ in range(15):
+                if card.parent is None:
+                    break
+                card = card.parent
+                cid = card.get("id", "") or ""
+                cls = " ".join(card.get("class") or [])
+                # Prefer widest known offer container, but stop when we
+                # hit something even wider (page-level) so we don't escape.
+                if (
+                    cid == "desktop_qualifiedBuyBox"
+                    or cid == "offer-display-features"
+                    or cid.startswith("offerDisplayFeatures")
+                    or "olpOffer" in cls
+                ):
+                    best = card
+                if cid in ("a-page", "dp", "centerCol", "ppd"):
+                    break
+            if best is not None and id(best) not in seen_card_ids:
+                seen_card_ids.add(id(best))
+                offer_cards.append(best)
+
+        for card in offer_cards:
+            # Seller name + id from any seller-profile link in the card
+            seller_a = card.select_one('a#sellerProfileTriggerId')
+            if not seller_a:
+                seller_a = card.find("a", href=re.compile(r"seller=[A-Z0-9]+"))
+            if not seller_a:
+                continue
+            seller_name = seller_a.get_text(strip=True)
+            if not seller_name:
+                continue
+            href = seller_a.get("href", "") or ""
+            sid_m = re.search(r"seller=([A-Z0-9]+)", href, re.I)
+            seller_id = sid_m.group(1) if sid_m else ""
+
+            # Price: pick the offer-display-price slot first; fall back to
+            # any non-strikethrough .a-offscreen with a rupee symbol.
+            price = None
+            price_slot = card.select_one('[offer-display-feature-name="desktop-price"]')
+            if not price_slot:
+                price_slot = card.find(id=re.compile(r"price.*feature_div", re.I))
+            search_root = price_slot if price_slot else card
+            for off in search_root.select("span.a-offscreen"):
+                # Skip if inside a struck-through/MRP container
+                parent_cls = " ".join((off.parent.get("class") or []) if off.parent else [])
+                ancestor_text_classes = " ".join(
+                    " ".join(p.get("class") or []) for p in off.parents if p.name
+                )
+                if "a-text-strike" in ancestor_text_classes or "a-text-price" in parent_cls:
+                    continue
+                txt = off.get_text(strip=True)
+                if "₹" in txt or "Rs" in txt or "INR" in txt:
+                    p = parse_price(txt)
+                    if p and p > 0:
+                        price = p
+                        break
+            if price is None:
+                # Fallback: take lowest non-strike price visible in the card
+                candidates = []
+                for off in card.select("span.a-offscreen"):
+                    ancestor_classes = " ".join(
+                        " ".join(p.get("class") or []) for p in off.parents if p.name
+                    )
+                    if "a-text-strike" in ancestor_classes:
+                        continue
+                    txt = off.get_text(strip=True)
+                    if "₹" in txt or "Rs" in txt:
+                        p = parse_price(txt)
+                        if p and p > 0:
+                            candidates.append(p)
+                if candidates:
+                    price = min(candidates)
+
+            block_html = str(card).lower()
+            is_fba = (
+                "isamazonfulfilled=1" in href.lower()
+                or "fulfilled by amazon" in block_html
+                or "amazon fulfilled" in block_html
+            )
+            is_prime = card.find(class_=re.compile(r"a-icon-prime", re.I)) is not None
+
+            key = f"{seller_id or seller_name}|{price}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            listings.append({
+                "seller_name": seller_name,
+                "price": price,
+                "condition": "New",
+                "is_fba": is_fba,
+                "prime_eligible": is_prime,
+            })
+
+        if listings:
+            return listings
 
     return listings
 
@@ -934,12 +1035,135 @@ def parse_buybox_seller(html: str) -> Optional[dict]:
 
 # ─── Offer listing scrape ─────────────────────────────────────────────────────
 
+async def fetch_aod_via_browser(asin: str) -> Optional[str]:
+    """Open product page, click 'See All Buying Options' to expand the AOD
+    popup (which contains all sellers + prices), wait for it to render,
+    return the full page HTML.
+
+    No URL-based fallbacks: testing showed they all redirect back to /dp/
+    and don't include the AOD list. Click is the only reliable path.
+    """
+    browser = await get_browser()
+    if not browser:
+        return None
+
+    product_url = f"https://www.amazon.in/dp/{asin}"
+    ctx = None
+    page = None
+    try:
+        ctx = await browser.new_context(
+            user_agent=pick_ua(),
+            viewport=pick_viewport(),
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+            extra_http_headers={"Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8", "DNT": "1"},
+            color_scheme="light",
+            ignore_https_errors=bool(PROXY_URL),
+        )
+        await ctx.add_init_script(STEALTH_SCRIPT)
+        page = await ctx.new_page()
+
+        # NO route-blocking — Amazon's AOD popup is rendered by inline JS
+        # that depends on its full asset bundle being available.
+
+        # 1. Load product page (retry on transient proxy/Amazon errors)
+        last_err = None
+        for attempt in range(3):
+            try:
+                await page.goto(product_url, wait_until="domcontentloaded", timeout=90_000)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "ERR_HTTP_RESPONSE_CODE_FAILURE" in msg or "ERR_TUNNEL" in msg or "Timeout" in msg:
+                    print(f"[scraper] {asin} goto retry {attempt+1}: {msg.splitlines()[0][:120]}")
+                    await asyncio.sleep(human_delay(2.0, 4.0))
+                    continue
+                raise
+        if last_err:
+            raise last_err
+        await asyncio.sleep(human_delay(1.0, 2.0))
+
+        product_html = await page.content()
+        if is_blocked(product_html):
+            print(f"[scraper] {asin} product page blocked")
+            return None
+
+        # 2. Find AOD ingress link
+        ingress = page.locator(
+            "#aod-ingress-link, a[href*='aod=1'], #buybox-see-all-buying-choices a"
+        ).first
+        if await ingress.count() == 0:
+            # Genuinely only one seller available
+            print(f"[scraper] {asin} no AOD ingress (single-seller product)")
+            return product_html
+
+        # 3. Click ingress (with JS fallback)
+        try:
+            await ingress.scroll_into_view_if_needed(timeout=5_000)
+        except Exception:
+            pass
+        await asyncio.sleep(human_delay(0.3, 0.8))
+        try:
+            await ingress.click(timeout=8_000)
+        except Exception:
+            try:
+                await page.evaluate(
+                    "(() => { const el = document.querySelector('#aod-ingress-link, a[href*=\"aod=1\"]'); if (el) el.click(); })()"
+                )
+            except Exception as e:
+                print(f"[scraper] {asin} ingress click failed: {e}")
+
+        # 4. Wait for AOD list to render
+        try:
+            await page.wait_for_selector(
+                "#aod-offer-soldBy, #aod-pinned-offer, #aod-offer-list",
+                timeout=20_000,
+                state="attached",
+            )
+        except Exception:
+            print(f"[scraper] {asin} AOD list selector timeout")
+
+        await asyncio.sleep(human_delay(1.5, 2.5))
+
+        # 5. Scroll inside AOD container to trigger lazy-loading of more offers
+        try:
+            await page.evaluate(
+                """() => {
+                    const c = document.querySelector('#aod-offer-list, #all-offers-display-scroller, #aod-container');
+                    if (c) c.scrollTop = c.scrollHeight;
+                    window.scrollTo(0, document.body.scrollHeight);
+                }"""
+            )
+            await asyncio.sleep(1.5)
+        except Exception:
+            pass
+
+        return await page.content()
+
+    except Exception as e:
+        print(f"[scraper] fetch_aod_via_browser failed for {asin}: {e}")
+        return None
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+
 async def scrape_offer_listings(asin: str) -> list[dict]:
     """Full offer-listing scrape.
 
     Priority:
     1. Amazon PA API (official, no IP blocks — primary)
-    2. Browser: open product page, click AOD ingress, parse AOD panel
+    2. Browser: warm session on /dp/, navigate to AOD AJAX URL
     3. Static warm-session AOD AJAX fallback
     4. AI extraction from whatever HTML we managed to get
     """
@@ -950,32 +1174,22 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
     if pa_listings:
         return pa_listings
 
-    # ── 2. Browser + AOD click ────────────────────────────────────────────────
     last_html: Optional[str] = None
 
-    html = await fetch_html_browser(
-        product_url,
-        click_selector=(
-            "#aod-ingress-link, "
-            "a[href*='aod=1'], "
-            "#buybox-see-all-buying-choices a, "
-            ".a-declarative[data-action='aod-ingress'], "
-            "#buyNew_noncbb"
-        ),
-        wait_selector="#aod-offer-soldBy, #aod-pinned-offer, #aod-offer-list",
-        extra_wait_s=2.0,
-        retries=1,
-    )
-    if html:
-        last_html = html  # always keep for AI fallback
-        listings = parse_aod_html(html)
+    # ── 2. Browser -> product page + AOD URL navigation ────────────────────────
+    aod_html = await fetch_aod_via_browser(asin)
+    if aod_html:
+        last_html = aod_html
+        listings = parse_aod_html(aod_html)
         if listings:
+            print(f"[scraper] {asin} -> {len(listings)} sellers via AOD")
             return listings
-        single = parse_buybox_seller(html)
+        single = parse_buybox_seller(aod_html)
         if single:
-            return [single]
+            print(f"[scraper] {asin} -> 1 buybox seller (AOD parse empty)")
+            # don't early-return; try static fallback for more offers
 
-    # Static AOD AJAX fallback
+    # ── 3. Static AOD AJAX fallback ───────────────────────────────────────────
     product_html = await fetch_html_static(product_url)
     if product_html:
         if not last_html:
@@ -984,6 +1198,7 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
             ua = pick_ua()
             client = await get_static_client()
             for aod_url in (
+                f"https://www.amazon.in/gp/aod/ajax/ref=dp_aod_ALL_mbc?asin={asin}&pc=dp&experienceId=aodAjaxMain",
                 f"https://www.amazon.in/gp/aod/ajax/ref=dp_aod_NEW_mbc?asin={asin}&pc=dp",
                 f"https://www.amazon.in/gp/aod/ajax?asin={asin}&pc=dp&isonlyrenderofferlist=false",
             ):
@@ -999,10 +1214,11 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
                         },
                     )
                     if r.is_success:
-                        last_html = r.text  # always keep latest html for AI
+                        last_html = r.text
                         if not is_blocked(r.text):
                             listings = parse_aod_html(r.text)
                             if listings:
+                                print(f"[scraper] {asin} -> {len(listings)} sellers via static AOD")
                                 return listings
                 except Exception as e:
                     print(f"[scraper] AOD AJAX fallback failed for {asin}: {e}")
@@ -1013,6 +1229,12 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
         ai_listings = await ai_extract_offers(last_html, asin)
         if ai_listings:
             return ai_listings
+
+        # Last resort: buybox seller from the product page (single seller, but with price)
+        single = parse_buybox_seller(last_html)
+        if single:
+            print(f"[scraper] {asin} -> 1 buybox seller (final fallback)")
+            return [single]
 
     return []
 
@@ -1254,4 +1476,5 @@ async def scrape_product(asin: str, url: str) -> Optional[dict]:
             }
 
     return None
+
 
