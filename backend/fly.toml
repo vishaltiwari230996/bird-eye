@@ -1,0 +1,36 @@
+app = "birdeye-backend"
+primary_region = "sin"        # Singapore — closest to amazon.in
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  APP_ENV = "production"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false  # keep machine warm so browser singleton stays alive
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 10
+    soft_limit = 6
+
+[[vm]]
+  memory = "2gb"              # Chromium needs ~800 MB; 2 GB gives safe headroom
+  cpu_kind = "shared"
+  cpus = 1
+
+[checks]
+  [checks.health]
+    grace_period = "30s"      # give Playwright time to initialise on cold start
+    interval = "30s"
+    method = "GET"
+    path = "/docs"
+    port = 8080
+    timeout = "10s"
+    type = "http"

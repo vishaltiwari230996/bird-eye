@@ -39,8 +39,8 @@ RUN playwright install chromium
 # Copy application code
 COPY . .
 
-# Cloud Run injects PORT env var; default to 8000 locally
-ENV PORT=8000
+# HuggingFace / Cloud Run inject PORT; default to 8080
+ENV PORT=8080
 ENV APP_ENV=production
 
 # Chromium path inside the Playwright cache (set so scraper can find it)
