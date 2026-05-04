@@ -1,0 +1,31 @@
+name: Daily seller refresh
+
+on:
+  schedule:
+    # Runs every day at 02:00 UTC (07:30 IST)
+    - cron: "0 2 * * *"
+  workflow_dispatch:  # also allow manual run from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger seller refresh on HF Space
+        env:
+          API_URL: https://moonshinemadara-myspace.hf.space
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET secret is not set in this repo"
+            exit 1
+          fi
+          echo "Calling $API_URL/api/sellers/refresh-all ..."
+          # Stream the SSE response; cap at 30 minutes so a stuck call doesn't hang the job.
+          curl -sS --max-time 1800 -N \
+               -X POST "$API_URL/api/sellers/refresh-all" \
+               -H "Authorization: Bearer $CRON_SECRET" \
+               -H "Accept: text/event-stream" \
+            | tee refresh.log
+          echo
+          echo "=== Refresh finished ==="
+          tail -n 5 refresh.log
