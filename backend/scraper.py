@@ -11,10 +11,13 @@ Expert-grade anti-detection rewrite:
   * Comprehensive block/CAPTCHA detection
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import random
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -220,6 +223,131 @@ def parse_price(raw: str) -> Optional[float]:
     raw = re.sub(r"[^\d.,]", "", raw.replace(",", ""))
     m = re.search(r"\d+(?:\.\d+)?", raw)
     return float(m.group()) if m else None
+
+
+# ─── Amazon PA API seller fetch ──────────────────────────────────────────────
+
+def _paapi_sign(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+async def fetch_sellers_paapi(asin: str) -> list[dict]:
+    """Fetch offer listings via Amazon Product Advertising API v5.
+
+    Official API — no scraping, no IP blocks, works from any server.
+    Requires AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_PARTNER_TAG in env.
+    """
+    access_key = os.getenv("AMAZON_ACCESS_KEY", "")
+    secret_key  = os.getenv("AMAZON_SECRET_KEY", "")
+    partner_tag = os.getenv("AMAZON_PARTNER_TAG", "")
+    if not all([access_key, secret_key, partner_tag]):
+        print("[paapi] Missing credentials — skipping PA API")
+        return []
+
+    host   = "webservices.amazon.in"
+    region = "eu-west-1"
+    service = "ProductAdvertisingAPI"
+    target  = "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.GetItems"
+    path    = "/paapi5/getitems"
+
+    body = json.dumps({
+        "ItemIds": [asin],
+        "Resources": [
+            "Offers.Listings.Condition",
+            "Offers.Listings.DeliveryInfo.IsPrimeEligible",
+            "Offers.Listings.IsBuyBoxWinner",
+            "Offers.Listings.MerchantInfo",
+            "Offers.Listings.Price",
+        ],
+        "PartnerTag": partner_tag,
+        "PartnerType": "Associates",
+        "Marketplace": "www.amazon.in",
+    }, separators=(",", ":"))
+
+    now        = datetime.now(timezone.utc)
+    amz_date   = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+
+    payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    canonical_headers = (
+        "content-encoding:amz-1.0\n"
+        "content-type:application/json; charset=UTF-8\n"
+        f"host:{host}\n"
+        f"x-amz-date:{amz_date}\n"
+        f"x-amz-target:{target}\n"
+    )
+    signed_headers = "content-encoding;content-type;host;x-amz-date;x-amz-target"
+
+    canonical_request = "\n".join(["POST", path, "", canonical_headers, signed_headers, payload_hash])
+
+    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amz_date, credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+
+    signing_key = _paapi_sign(
+        _paapi_sign(
+            _paapi_sign(
+                _paapi_sign(f"AWS4{secret_key}".encode("utf-8"), date_stamp),
+                region,
+            ),
+            service,
+        ),
+        "aws4_request",
+    )
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    auth = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"https://{host}{path}",
+                content=body.encode("utf-8"),
+                headers={
+                    "content-encoding": "amz-1.0",
+                    "content-type": "application/json; charset=UTF-8",
+                    "host": host,
+                    "x-amz-date": amz_date,
+                    "x-amz-target": target,
+                    "Authorization": auth,
+                },
+            )
+
+        if r.status_code != 200:
+            print(f"[paapi] {asin} → HTTP {r.status_code}: {r.text[:300]}")
+            return []
+
+        data = r.json()
+        listings: list[dict] = []
+        for item in data.get("ItemsResult", {}).get("Items", []):
+            for offer in item.get("Offers", {}).get("Listings", []):
+                price_obj   = offer.get("Price", {})
+                price       = price_obj.get("Amount")
+                merchant    = offer.get("MerchantInfo", {})
+                seller_name = merchant.get("Name") or "Unknown"
+                is_prime    = offer.get("DeliveryInfo", {}).get("IsPrimeEligible", False)
+                cond        = offer.get("Condition", {}).get("Value", "New")
+                is_fba      = "amazon" in seller_name.lower()
+                listings.append({
+                    "seller_name": seller_name,
+                    "price": float(price) if price is not None else None,
+                    "condition": cond,
+                    "is_fba": is_fba,
+                    "prime_eligible": is_prime,
+                })
+
+        print(f"[paapi] {asin} → {len(listings)} offers via PA API")
+        return listings
+
+    except Exception as e:
+        print(f"[paapi] Exception for {asin}: {e}")
+        return []
 
 
 # ─── AI-powered extraction helpers ───────────────────────────────────────────
@@ -713,11 +841,19 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
     """Full offer-listing scrape.
 
     Priority:
-    1. Browser: open product page, click AOD ingress, parse AOD panel
-    2. Static warm-session AOD AJAX fallback
-    3. AI extraction from whatever HTML we managed to get
+    1. Amazon PA API (official, no IP blocks — primary)
+    2. Browser: open product page, click AOD ingress, parse AOD panel
+    3. Static warm-session AOD AJAX fallback
+    4. AI extraction from whatever HTML we managed to get
     """
     product_url = f"https://www.amazon.in/dp/{asin}"
+
+    # ── 1. PA API (official, always works from any server) ────────────────────
+    pa_listings = await fetch_sellers_paapi(asin)
+    if pa_listings:
+        return pa_listings
+
+    # ── 2. Browser + AOD click ────────────────────────────────────────────────
     last_html: Optional[str] = None
 
     html = await fetch_html_browser(

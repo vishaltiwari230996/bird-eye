@@ -254,8 +254,10 @@ async def refresh_sellers(product_id: int):
 
 @app.post("/api/sellers/refresh-all")
 async def refresh_all_sellers():
-    """SSE-streaming bulk seller refresh for all Amazon products."""
-    rows = query("SELECT id, asin_or_sku FROM products WHERE platform='amazon' ORDER BY id")
+    """SSE-streaming bulk seller refresh — PW own products only."""
+    rows = query(
+        "SELECT id, asin_or_sku FROM products WHERE platform='amazon' AND is_own=true ORDER BY id"
+    )
 
     async def generate():
         total = len(rows)
