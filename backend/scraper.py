@@ -32,6 +32,53 @@ CHROME_PATH = os.environ.get(
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
 )
 
+# ─── Proxy configuration (BrightData / generic HTTP proxy) ───────────────────
+# Set PROXY_URL like: http://user:pass@brd.superproxy.io:33335
+# Or set PROXY_HOST / PROXY_PORT / PROXY_USER / PROXY_PASS individually.
+def _build_proxy_url() -> Optional[str]:
+    url = os.environ.get("PROXY_URL", "").strip()
+    if url:
+        return url
+    host = os.environ.get("PROXY_HOST", "").strip()
+    port = os.environ.get("PROXY_PORT", "").strip()
+    if not (host and port):
+        return None
+    user = os.environ.get("PROXY_USER", "").strip()
+    pwd = os.environ.get("PROXY_PASS", "").strip()
+    scheme = os.environ.get("PROXY_SCHEME", "http").strip() or "http"
+    if user and pwd:
+        from urllib.parse import quote
+        return f"{scheme}://{quote(user, safe='')}:{quote(pwd, safe='')}@{host}:{port}"
+    return f"{scheme}://{host}:{port}"
+
+
+PROXY_URL = _build_proxy_url()
+PROXY_VERIFY_SSL = os.environ.get("PROXY_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
+
+if PROXY_URL:
+    # Mask password for logging
+    import re as _re
+    _masked = _re.sub(r"://([^:]+):([^@]+)@", r"://\1:****@", PROXY_URL)
+    print(f"[scraper] Proxy enabled: {_masked} (verify_ssl={PROXY_VERIFY_SSL})")
+else:
+    print("[scraper] No proxy configured (set PROXY_URL or PROXY_HOST/PORT/USER/PASS)")
+
+
+def _playwright_proxy() -> Optional[dict]:
+    """Convert PROXY_URL into Playwright's proxy dict format."""
+    if not PROXY_URL:
+        return None
+    from urllib.parse import urlparse, unquote
+    p = urlparse(PROXY_URL)
+    if not p.hostname or not p.port:
+        return None
+    out = {"server": f"{p.scheme}://{p.hostname}:{p.port}"}
+    if p.username:
+        out["username"] = unquote(p.username)
+    if p.password:
+        out["password"] = unquote(p.password)
+    return out
+
 # Real Chrome 131/132 UAs sampled from public analytics (Windows + macOS + Linux)
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.205 Safari/537.36",
@@ -183,10 +230,17 @@ async def get_browser():
             "--no-first-run",
             "--no-default-browser-check",
         ]
+        if PROXY_URL:
+            # BrightData proxy presents its own cert for HTTPS interception
+            args.append("--ignore-certificate-errors")
 
         launch_kwargs: dict = dict(headless=True, args=args)
         if use_local_chrome:
             launch_kwargs["executable_path"] = CHROME_PATH
+
+        proxy_cfg = _playwright_proxy()
+        if proxy_cfg:
+            launch_kwargs["proxy"] = proxy_cfg
 
         _browser_instance = await _pw_instance.chromium.launch(**launch_kwargs)
         _browser_instance.on("disconnected", _on_browser_disconnect)
@@ -337,7 +391,11 @@ async def fetch_sellers_paapi(asin: str) -> list[dict]:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        client_kwargs: dict = {"timeout": 15}
+        if PROXY_URL:
+            client_kwargs["proxy"] = PROXY_URL
+            client_kwargs["verify"] = PROXY_VERIFY_SSL
+        async with httpx.AsyncClient(**client_kwargs) as client:
             r = await client.post(
                 f"https://{host}{path}",
                 content=body.encode("utf-8"),
@@ -578,12 +636,18 @@ _static_client: Optional[httpx.AsyncClient] = None
 async def get_static_client() -> httpx.AsyncClient:
     global _static_client
     if _static_client is None or _static_client.is_closed:
-        _static_client = httpx.AsyncClient(
-            timeout=20,
+        kwargs: dict = dict(
+            timeout=30,
             follow_redirects=True,
-            http2=True,
             limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
         )
+        if PROXY_URL:
+            # BrightData proxy doesn't support HTTP/2; use HTTP/1.1
+            kwargs["proxy"] = PROXY_URL
+            kwargs["verify"] = PROXY_VERIFY_SSL
+        else:
+            kwargs["http2"] = True
+        _static_client = httpx.AsyncClient(**kwargs)
     return _static_client
 
 
@@ -636,6 +700,7 @@ async def fetch_html_browser(
                 timezone_id="Asia/Kolkata",
                 extra_http_headers={"Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8", "DNT": "1"},
                 color_scheme="light",
+                ignore_https_errors=bool(PROXY_URL),
             )
             await ctx.add_init_script(STEALTH_SCRIPT)
             page = await ctx.new_page()
