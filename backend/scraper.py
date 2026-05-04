@@ -734,7 +734,7 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
         retries=1,
     )
     if html:
-        last_html = html
+        last_html = html  # always keep for AI fallback
         listings = parse_aod_html(html)
         if listings:
             return listings
@@ -744,33 +744,35 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
 
     # Static AOD AJAX fallback
     product_html = await fetch_html_static(product_url)
-    if product_html and not is_blocked(product_html):
+    if product_html:
         if not last_html:
             last_html = product_html
-        ua = pick_ua()
-        client = await get_static_client()
-        for aod_url in (
-            f"https://www.amazon.in/gp/aod/ajax/ref=dp_aod_NEW_mbc?asin={asin}&pc=dp",
-            f"https://www.amazon.in/gp/aod/ajax?asin={asin}&pc=dp&isonlyrenderofferlist=false",
-        ):
-            try:
-                await asyncio.sleep(human_delay(1.0, 2.5))
-                r = await client.get(
-                    aod_url,
-                    headers={
-                        **build_static_headers(ua, referer=product_url),
-                        "Sec-Fetch-Dest": "empty",
-                        "Sec-Fetch-Mode": "cors",
-                        "Sec-Fetch-Site": "same-origin",
-                    },
-                )
-                if r.is_success and not is_blocked(r.text):
-                    last_html = r.text
-                    listings = parse_aod_html(r.text)
-                    if listings:
-                        return listings
-            except Exception as e:
-                print(f"[scraper] AOD AJAX fallback failed for {asin}: {e}")
+        if not is_blocked(product_html):
+            ua = pick_ua()
+            client = await get_static_client()
+            for aod_url in (
+                f"https://www.amazon.in/gp/aod/ajax/ref=dp_aod_NEW_mbc?asin={asin}&pc=dp",
+                f"https://www.amazon.in/gp/aod/ajax?asin={asin}&pc=dp&isonlyrenderofferlist=false",
+            ):
+                try:
+                    await asyncio.sleep(human_delay(1.0, 2.5))
+                    r = await client.get(
+                        aod_url,
+                        headers={
+                            **build_static_headers(ua, referer=product_url),
+                            "Sec-Fetch-Dest": "empty",
+                            "Sec-Fetch-Mode": "cors",
+                            "Sec-Fetch-Site": "same-origin",
+                        },
+                    )
+                    if r.is_success:
+                        last_html = r.text  # always keep latest html for AI
+                        if not is_blocked(r.text):
+                            listings = parse_aod_html(r.text)
+                            if listings:
+                                return listings
+                except Exception as e:
+                    print(f"[scraper] AOD AJAX fallback failed for {asin}: {e}")
 
     # AI fallback — extract sellers from whatever page we got
     if last_html:
@@ -958,24 +960,23 @@ async def scrape_product(asin: str, url: str) -> Optional[dict]:
     last_html: Optional[str] = None
 
     html = await fetch_html_static(url)
-    if html and not is_blocked(html):
-        payload = parse_product_page(html)
-        if payload and payload.get("price"):
-            return payload
-        # Selectors returned incomplete data — save html for AI fallback
+    if html:
         last_html = html
-        if payload:
-            # Title found but price missing — try AI to fill gaps
-            ai_data = await ai_extract_product(html)
-            if ai_data:
-                payload["price"] = payload.get("price") or ai_data.get("price")
-                payload["rating"] = payload.get("rating") or ai_data.get("rating")
-                payload["reviewCount"] = payload.get("reviewCount") or ai_data.get("reviewCount")
-                payload["availability"] = payload.get("availability") or ai_data.get("availability")
-                payload["bsr"] = payload.get("bsr") or ai_data.get("bsr")
-                if payload.get("offers"):
-                    payload["offers"]["seller"] = payload["offers"].get("seller") or ai_data.get("seller")
-            return payload
+        if not is_blocked(html):
+            payload = parse_product_page(html)
+            if payload and payload.get("price"):
+                return payload
+            if payload:
+                ai_data = await ai_extract_product(html)
+                if ai_data:
+                    payload["price"] = payload.get("price") or ai_data.get("price")
+                    payload["rating"] = payload.get("rating") or ai_data.get("rating")
+                    payload["reviewCount"] = payload.get("reviewCount") or ai_data.get("reviewCount")
+                    payload["availability"] = payload.get("availability") or ai_data.get("availability")
+                    payload["bsr"] = payload.get("bsr") or ai_data.get("bsr")
+                    if payload.get("offers"):
+                        payload["offers"]["seller"] = payload["offers"].get("seller") or ai_data.get("seller")
+                return payload
 
     await asyncio.sleep(human_delay(1.0, 2.5))
     html = await fetch_html_browser(
@@ -983,23 +984,23 @@ async def scrape_product(asin: str, url: str) -> Optional[dict]:
         extra_wait_s=2.0,
         retries=1,
     )
-    if html and not is_blocked(html):
+    if html:
         last_html = html
-        payload = parse_product_page(html)
-        if payload and payload.get("price"):
-            return payload
-        if payload:
-            # Fill gaps with AI
-            ai_data = await ai_extract_product(html)
-            if ai_data:
-                payload["price"] = payload.get("price") or ai_data.get("price")
-                payload["rating"] = payload.get("rating") or ai_data.get("rating")
-                payload["reviewCount"] = payload.get("reviewCount") or ai_data.get("reviewCount")
-                payload["availability"] = payload.get("availability") or ai_data.get("availability")
-                payload["bsr"] = payload.get("bsr") or ai_data.get("bsr")
-                if payload.get("offers"):
-                    payload["offers"]["seller"] = payload["offers"].get("seller") or ai_data.get("seller")
-            return payload
+        if not is_blocked(html):
+            payload = parse_product_page(html)
+            if payload and payload.get("price"):
+                return payload
+            if payload:
+                ai_data = await ai_extract_product(html)
+                if ai_data:
+                    payload["price"] = payload.get("price") or ai_data.get("price")
+                    payload["rating"] = payload.get("rating") or ai_data.get("rating")
+                    payload["reviewCount"] = payload.get("reviewCount") or ai_data.get("reviewCount")
+                    payload["availability"] = payload.get("availability") or ai_data.get("availability")
+                    payload["bsr"] = payload.get("bsr") or ai_data.get("bsr")
+                    if payload.get("offers"):
+                        payload["offers"]["seller"] = payload["offers"].get("seller") or ai_data.get("seller")
+                return payload
 
     # Both static + browser failed or returned no title — pure AI extraction
     if last_html:
