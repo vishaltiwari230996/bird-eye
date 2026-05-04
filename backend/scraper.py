@@ -225,6 +225,38 @@ def parse_price(raw: str) -> Optional[float]:
     return float(m.group()) if m else None
 
 
+def is_blocked(html: str) -> bool:
+    """Detect all known Amazon bot/CAPTCHA/redirect block patterns."""
+    if not html or len(html) < 500:
+        return True
+    soup = BeautifulSoup(html, "html.parser")
+    title = (soup.title.string or "").strip() if soup.title else ""
+    low_title = title.lower()
+    low_html = html.lower()
+
+    if low_title in ("amazon.in", "amazon.com", "", "access denied", "service unavailable"):
+        return True
+
+    if any(kw in low_html for kw in (
+        "type the characters you see",
+        "enter the characters you see",
+        "robot check",
+        "/errors/validatecaptcha",
+        "captcha",
+        "ap_captcha",
+        "recaptcha",
+        "sorry, we just need to make sure",
+        "to discuss automated access",
+        "automated access",
+    )):
+        return True
+
+    if "<title>amazon.in</title>" in low_html and len(html) < 5000:
+        return True
+
+    return False
+
+
 # ─── Amazon PA API seller fetch ──────────────────────────────────────────────
 
 def _paapi_sign(key: bytes, msg: str) -> bytes:
