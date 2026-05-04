@@ -1381,12 +1381,27 @@ def parse_product_page(html: str) -> Optional[dict]:
     seller_el = soup.find(id="sellerProfileTriggerId") or soup.find(id="merchant-info")
     seller = seller_el.get_text(strip=True) if seller_el else None
 
+    # Description: feature bullets + productDescription block
+    description_parts: list[str] = []
+    if feature_bullets:
+        for li in feature_bullets.find_all("li"):
+            t = li.get_text(" ", strip=True)
+            if t and "hide" not in (li.get("class") or []):
+                description_parts.append(t)
+    pd = soup.find(id="productDescription") or soup.find(id="bookDescription_feature_div")
+    if pd:
+        t = pd.get_text(" ", strip=True)
+        if t:
+            description_parts.append(t)
+    description = " \u2022 ".join(description_parts)[:4000] if description_parts else None
+
     return {
         "title": title,
         "price": price,
         "rating": rating,
         "reviewCount": review_count,
         "bsr": bsr,
+        "description": description,
         "currency": "INR",
         "availability": availability,
         "image": image,

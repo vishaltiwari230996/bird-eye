@@ -129,6 +129,16 @@ def diff_payloads(prev: dict, next_: dict) -> list[dict]:
     if rc_new > 0 and rc_old != rc_new:
         add("reviewCount", str(int(rc_old)), str(int(rc_new)))
 
+    # BSR
+    bsr_old, bsr_new = (prev.get("bsr") or ""), (next_.get("bsr") or "")
+    if bsr_new and _norm(bsr_old) != _norm(bsr_new):
+        add("offers.bsr", bsr_old or "—", bsr_new)
+
+    # Description (feature bullets + product description)
+    d_old, d_new = _norm(prev.get("description")), _norm(next_.get("description"))
+    if d_new and d_old != d_new:
+        add("description", prev.get("description", "") or "", next_.get("description", "") or "")
+
     return changes
 
 

@@ -1,0 +1,30 @@
+name: Daily competitor snapshot
+
+on:
+  schedule:
+    # 02:30 UTC = 08:00 IST. Runs after the 02:00 UTC sellers refresh
+    # so seller scrapes don't collide with snapshot scrapes.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Snapshot every product (PW + competitors)
+        env:
+          API_URL: https://moonshinemadara-myspace.hf.space
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -sS --max-time 1800 -X POST "$API_URL/api/cron/monitor" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -H "Accept: application/json" \
+            | tee monitor.log
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-log
+          path: monitor.log
+          if-no-files-found: ignore

@@ -41,21 +41,27 @@ interface ProductFull {
   seller_offers: SellerOffer[] | null;
 }
 
+type ChangeKind = 'title' | 'description' | 'bsr' | 'price';
+
 interface Card {
   id: number;
   platform: string;
   asin_or_sku: string;
   url: string;
   title: string;
+  description: string | null;
   price: number | null;
   rating: number | null;
   reviews: number | null;
+  bsr: string | null;
   in_stock: boolean | null;
-  image: string | null;
   last_seen_at: string | null;
+  is_own: boolean;
+  brand: string;
+  pools: string[];
   changes: RecentChange[];
   insights: ChangeInsight[];
-  pools: string[];
+  changeFlags: Record<ChangeKind, RecentChange | null>;
   sellers: SellerOffer[];
 }
 
@@ -86,13 +92,39 @@ function chipToneClass(tone: ChangeInsight['tone']): string {
   }
 }
 
-function pickImage(payload: any): string | null {
-  if (!payload) return null;
-  if (typeof payload.image === 'string' && payload.image) return payload.image;
-  if (typeof payload.imageUrl === 'string') return payload.imageUrl;
-  if (Array.isArray(payload.images) && payload.images.length) return String(payload.images[0]);
-  if (Array.isArray(payload.image_urls) && payload.image_urls.length) return String(payload.image_urls[0]);
-  return null;
+const BRAND_ORDER = ['PW', 'Educart', 'Oswaal', 'MTG'];
+
+function brandFromPoolName(name: string): string {
+  const cleaned = name.trim();
+  if (cleaned.includes(' - ')) return cleaned.split(' - ')[0].trim();
+  for (const b of BRAND_ORDER) {
+    if (cleaned.toLowerCase().startsWith(b.toLowerCase())) return b;
+  }
+  return 'Other';
+}
+
+const CHANGE_FIELDS: Record<ChangeKind, (field: string) => boolean> = {
+  title: (f) => f === 'title',
+  description: (f) => f === 'description',
+  bsr: (f) => f === 'offers.bsr' || f === 'offers.bestSellerRank' || f === 'bsr',
+  price: (f) => f === 'price',
+};
+
+const CHANGE_LABEL: Record<ChangeKind, string> = {
+  title: 'Title',
+  description: 'Desc',
+  bsr: 'BSR',
+  price: 'Price',
+};
+
+function buildChangeFlags(changes: RecentChange[]): Record<ChangeKind, RecentChange | null> {
+  const out: Record<ChangeKind, RecentChange | null> = { title: null, description: null, bsr: null, price: null };
+  for (const c of changes) {
+    for (const k of Object.keys(CHANGE_FIELDS) as ChangeKind[]) {
+      if (out[k] == null && CHANGE_FIELDS[k](c.field)) out[k] = c;
+    }
+  }
+  return out;
 }
 
 export default function Products() {
@@ -102,6 +134,7 @@ export default function Products() {
   const [search, setSearch] = useState('');
   const [platform, setPlatform] = useState<'all' | 'amazon' | 'flipkart'>('all');
   const [busyAll, setBusyAll] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set());
   const [sellerBusyIds, setSellerBusyIds] = useState<Set<number>>(new Set());
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -111,48 +144,50 @@ export default function Products() {
     const poolNamesById = new Map<number, string[]>();
     for (const pool of pools) {
       for (const pp of pool.products ?? []) {
-        if (pp.is_own) {
-          ownIds.add(pp.id);
-          const arr = poolNamesById.get(pp.id) ?? [];
-          arr.push(pool.name);
-          poolNamesById.set(pp.id, arr);
-        }
+        const arr = poolNamesById.get(pp.id) ?? [];
+        arr.push(pool.name);
+        poolNamesById.set(pp.id, arr);
+        if (pp.is_own) ownIds.add(pp.id);
       }
     }
-    return products
-      .filter((p) => ownIds.has(p.id))
-      .map((p) => {
-        const payload = p.last_snapshot?.payload_json ?? {};
-        const title = payload.title || p.title_known || p.asin_or_sku;
-        const price = payload.price != null ? Number(payload.price) : null;
-        const rating = payload.rating != null ? Number(payload.rating) : null;
-        const reviews = payload.reviewCount != null ? Number(payload.reviewCount) : null;
-        const inStock =
-          typeof payload.inStock === 'boolean'
-            ? payload.inStock
-            : typeof payload.in_stock === 'boolean'
-            ? payload.in_stock
-            : null;
-        const changes = p.recent_changes ?? [];
-        const insights = changes.slice(0, 3).map(summarizeChange);
-        return {
-          id: p.id,
-          platform: p.platform,
-          asin_or_sku: p.asin_or_sku,
-          url: p.url,
-          title,
-          price,
-          rating,
-          reviews,
-          in_stock: inStock,
-          image: pickImage(payload),
-          last_seen_at: p.last_seen_at,
-          changes,
-          insights,
-          pools: poolNamesById.get(p.id) ?? [],
-          sellers: p.seller_offers ?? [],
-        };
-      });
+    return products.map((p) => {
+      const payload = p.last_snapshot?.payload_json ?? {};
+      const title = payload.title || p.title_known || p.asin_or_sku;
+      const price = payload.price != null ? Number(payload.price) : null;
+      const rating = payload.rating != null ? Number(payload.rating) : null;
+      const reviews = payload.reviewCount != null ? Number(payload.reviewCount) : null;
+      const bsr = typeof payload.bsr === 'string' && payload.bsr ? payload.bsr : null;
+      const description = typeof payload.description === 'string' && payload.description ? payload.description : null;
+      const inStock =
+        typeof payload.inStock === 'boolean' ? payload.inStock
+        : typeof payload.in_stock === 'boolean' ? payload.in_stock
+        : null;
+      const changes = p.recent_changes ?? [];
+      const insights = changes.slice(0, 3).map(summarizeChange);
+      const pools = poolNamesById.get(p.id) ?? [];
+      const brand = pools.length ? brandFromPoolName(pools[0]) : 'Other';
+      return {
+        id: p.id,
+        platform: p.platform,
+        asin_or_sku: p.asin_or_sku,
+        url: p.url,
+        title,
+        description,
+        price,
+        rating,
+        reviews,
+        bsr,
+        in_stock: inStock,
+        last_seen_at: p.last_seen_at,
+        is_own: ownIds.has(p.id),
+        brand,
+        pools,
+        changes,
+        insights,
+        changeFlags: buildChangeFlags(changes),
+        sellers: p.seller_offers ?? [],
+      };
+    });
   };
 
   const load = async () => {
@@ -186,17 +221,6 @@ export default function Products() {
     }
   };
 
-  const checkAll = async () => {
-    if (!cards.length) return;
-    setBusyAll(true);
-    try {
-      await api.post('/api/run-check', { batch: cards.map((c) => c.id) });
-      await load();
-    } finally {
-      setBusyAll(false);
-    }
-  };
-
   const refreshSellers = async (id: number) => {
     setSellerBusyIds((s) => new Set(s).add(id));
     try {
@@ -204,6 +228,42 @@ export default function Products() {
       await load();
     } finally {
       setSellerBusyIds((s) => { const n = new Set(s); n.delete(id); return n; });
+    }
+  };
+
+  const fetchAllPwSellers = async () => {
+    setBusyAll(true);
+    setBulkProgress({ done: 0, total: 0 });
+    try {
+      const res = await api.post('/api/sellers/refresh-all');
+      if (!res.body) {
+        await load();
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split('\n\n');
+        buf = parts.pop() ?? '';
+        for (const part of parts) {
+          const line = part.split('\n').find((l) => l.startsWith('data: '));
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (typeof evt.done === 'number' && typeof evt.total === 'number') {
+              setBulkProgress({ done: evt.done, total: evt.total });
+            }
+          } catch { /* ignore */ }
+        }
+      }
+      await load();
+    } finally {
+      setBusyAll(false);
+      setBulkProgress(null);
     }
   };
 
@@ -215,16 +275,35 @@ export default function Products() {
       return (
         c.title.toLowerCase().includes(q) ||
         c.asin_or_sku.toLowerCase().includes(q) ||
+        c.brand.toLowerCase().includes(q) ||
         c.pools.some((p) => p.toLowerCase().includes(q))
       );
     });
   }, [cards, search, platform]);
+
+  const grouped = useMemo(() => {
+    const map = new Map<string, Card[]>();
+    for (const c of filtered) {
+      const arr = map.get(c.brand) ?? [];
+      arr.push(c);
+      map.set(c.brand, arr);
+    }
+    return [...map.entries()].sort((a, b) => {
+      const ai = BRAND_ORDER.indexOf(a[0]);
+      const bi = BRAND_ORDER.indexOf(b[0]);
+      const av = ai === -1 ? 999 : ai;
+      const bv = bi === -1 ? 999 : bi;
+      if (av !== bv) return av - bv;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [filtered]);
 
   const stats = useMemo(() => {
     const prices = cards.map((c) => c.price).filter((v): v is number => v != null);
     const ratings = cards.map((c) => c.rating).filter((v): v is number => v != null);
     return {
       total: cards.length,
+      pw: cards.filter((c) => c.is_own).length,
       avgPrice: prices.length ? prices.reduce((a, b) => a + b, 0) / prices.length : null,
       avgRating: ratings.length ? ratings.reduce((a, b) => a + b, 0) / ratings.length : null,
       withChange: cards.filter((c) => c.insights.length).length,
@@ -233,32 +312,25 @@ export default function Products() {
 
   return (
     <div className="space-y-12">
-      {/* HERO */}
       <section className="flex items-end justify-between gap-10 flex-wrap">
         <div className="max-w-2xl space-y-4">
-          <div className="kicker">PW Catalogue</div>
+          <div className="kicker">Catalogue Intelligence</div>
           <h1 className="serif text-[68px] leading-[0.95] tracking-tight" style={{ color: 'var(--ink)' }}>
             Products
           </h1>
           <p className="text-[16px] leading-relaxed" style={{ color: 'var(--muted)' }}>
-            Every SKU under our watch — captured as it shifts, priced as it stands.
+            Every PW SKU and competitor SKU under our watch — captured as they shift, priced as they stand.
           </p>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
-          <div className="metric-strip">
-            <div><div className="kicker">SKUs</div><div className="metric-val">{stats.total}</div></div>
-            <div><div className="kicker">Avg Price</div><div className="metric-val">{formatINR(stats.avgPrice)}</div></div>
-            <div><div className="kicker">Avg Rating</div><div className="metric-val">{stats.avgRating ? `★ ${stats.avgRating.toFixed(2)}` : '—'}</div></div>
-            <div><div className="kicker">Moving</div><div className="metric-val">{stats.withChange}</div></div>
-          </div>
-          <button className="btn btn-primary" onClick={checkAll} disabled={busyAll}>
-            {busyAll ? 'Checking…' : 'Check All'}
-          </button>
+        <div className="metric-strip">
+          <div><div className="kicker">Total</div><div className="metric-val">{stats.total}</div></div>
+          <div><div className="kicker">PW SKUs</div><div className="metric-val">{stats.pw}</div></div>
+          <div><div className="kicker">Avg Price</div><div className="metric-val">{formatINR(stats.avgPrice)}</div></div>
+          <div><div className="kicker">Moving</div><div className="metric-val">{stats.withChange}</div></div>
         </div>
       </section>
 
-      {/* FILTERS */}
       <section className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-2">
           {(['all', 'amazon', 'flipkart'] as const).map((k) => (
@@ -279,7 +351,7 @@ export default function Products() {
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search SKU, title, or cohort…"
+            placeholder="Search SKU, title, brand…"
           />
         </div>
       </section>
@@ -293,119 +365,186 @@ export default function Products() {
       {!loading && !filtered.length && !error && (
         <div className="panel p-10 text-center space-y-2">
           <div className="kicker">Empty</div>
-          <p className="serif text-[28px]" style={{ color: 'var(--ink)' }}>No PW SKUs match.</p>
-          <p style={{ color: 'var(--muted)' }}>Adjust filters or add products in a pool marked as own.</p>
+          <p className="serif text-[28px]" style={{ color: 'var(--ink)' }}>No SKUs match.</p>
+          <p style={{ color: 'var(--muted)' }}>Adjust filters or add products in a pool.</p>
         </div>
       )}
 
-      {!loading && filtered.length > 0 && (
-        <section className="card-grid">
-          {filtered.map((c) => {
-            const busy = busyIds.has(c.id);
-            const expanded = expandedId === c.id;
-            const sellerBusy = sellerBusyIds.has(c.id);
-            return (
-              <article
-                key={c.id}
-                className={`sku-card ${expanded ? 'sku-card--expanded' : ''}`}
-              >
+      {!loading && grouped.map(([brand, list]) => {
+        const isPw = brand === 'PW';
+        return (
+          <section key={brand} className="space-y-5">
+            <div className="flex items-end justify-between flex-wrap gap-4">
+              <div>
+                <div className="kicker">{isPw ? 'Our catalogue' : 'Competitor catalogue'}</div>
+                <h2 className="serif text-[32px] leading-tight" style={{ color: 'var(--ink)' }}>
+                  {brand} <span style={{ color: 'var(--faint)' }}>· {list.length}</span>
+                </h2>
+              </div>
+              {isPw && (
                 <button
-                  type="button"
-                  className="sku-card__head"
-                  onClick={() => setExpandedId(expanded ? null : c.id)}
-                  aria-expanded={expanded}
+                  className="btn btn-primary"
+                  onClick={fetchAllPwSellers}
+                  disabled={busyAll}
                 >
-                  <div className="sku-card__media">
-                    {c.image ? (
-                      <img src={c.image} alt={c.title} loading="lazy" referrerPolicy="no-referrer" />
-                    ) : (
-                      <div className="sku-card__placeholder">
-                        <span className="serif text-[32px]" style={{ color: 'var(--faint)' }}>{c.platform[0]?.toUpperCase()}</span>
-                      </div>
-                    )}
-                    <span className="sku-card__platform">{c.platform}</span>
-                    {c.in_stock === false && <span className="sku-card__oos">Out of stock</span>}
-                  </div>
-
-                  <div className="sku-card__body">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{c.asin_or_sku}</span>
-                      <span className="text-[11px]" style={{ color: 'var(--faint)' }}>{timeAgo(c.last_seen_at)}</span>
-                    </div>
-
-                    <div
-                      className="serif text-[20px] leading-tight sku-card__title"
-                      style={{ color: 'var(--ink)' }}
-                      title={c.title}
-                    >
-                      {c.title}
-                    </div>
-
-                    <div className="flex items-baseline justify-between gap-3">
-                      <div className="mono text-[20px]" style={{ color: 'var(--ink)' }}>{formatINR(c.price)}</div>
-                      <div className="text-[13px]" style={{ color: 'var(--ink-soft)' }}>
-                        {c.rating != null ? <>★ {c.rating.toFixed(1)}</> : '—'}
-                        <span className="mono ml-2 text-[12px]" style={{ color: 'var(--faint)' }}>
-                          {c.reviews != null ? c.reviews.toLocaleString('en-IN') : '—'}
-                        </span>
-                      </div>
-                    </div>
-
-                    {c.insights.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5">
-                        {c.insights.map((ins, i) => (
-                          <span key={i} className={chipToneClass(ins.tone)} title={ins.summary}>
-                            {ins.label}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-
-                    {c.pools.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5">
-                        {c.pools.slice(0, 3).map((p) => (
-                          <span key={p} className="chip-platform">{p}</span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+                  {busyAll
+                    ? bulkProgress
+                      ? `Fetching ${bulkProgress.done}/${bulkProgress.total}…`
+                      : 'Fetching…'
+                    : 'Fetch all PW sellers'}
                 </button>
+              )}
+            </div>
 
-                <div className="sku-card__foot">
-                  <button
-                    className="btn-ghost btn !py-[6px] !px-3 !text-[12px]"
-                    disabled={busy}
-                    onClick={(e) => { e.stopPropagation(); checkOne(c.id); }}
-                  >
-                    {busy ? '…' : 'Check'}
-                  </button>
-                  <a
-                    href={c.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="link-quiet text-[12px]"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    Open ↗
-                  </a>
-                  <span className="ml-auto text-[11px]" style={{ color: 'var(--faint)' }}>
-                    {expanded ? 'Click to collapse' : 'Click to expand'}
-                  </span>
-                </div>
-
-                {expanded && (
-                  <Expanded
-                    card={c}
-                    sellerBusy={sellerBusy}
-                    onRefreshSellers={() => refreshSellers(c.id)}
-                  />
-                )}
-              </article>
-            );
-          })}
-        </section>
-      )}
+            <div className="card-grid">
+              {list.map((c) => (
+                <ProductCard
+                  key={c.id}
+                  card={c}
+                  expanded={expandedId === c.id}
+                  busy={busyIds.has(c.id)}
+                  sellerBusy={sellerBusyIds.has(c.id)}
+                  onToggle={() => setExpandedId(expandedId === c.id ? null : c.id)}
+                  onCheck={() => checkOne(c.id)}
+                  onRefreshSellers={() => refreshSellers(c.id)}
+                />
+              ))}
+            </div>
+          </section>
+        );
+      })}
     </div>
+  );
+}
+
+function ProductCard({
+  card,
+  expanded,
+  busy,
+  sellerBusy,
+  onToggle,
+  onCheck,
+  onRefreshSellers,
+}: {
+  card: Card;
+  expanded: boolean;
+  busy: boolean;
+  sellerBusy: boolean;
+  onToggle: () => void;
+  onCheck: () => void;
+  onRefreshSellers: () => void;
+}) {
+  return (
+    <article className={`sku-card ${expanded ? 'sku-card--expanded' : ''}`}>
+      <button type="button" className="sku-card__head" onClick={onToggle} aria-expanded={expanded}>
+        <div className="sku-card__detail-strip">
+          <div className="sku-card__detail-row">
+            <span className="kicker">{card.is_own ? 'PW' : card.brand}</span>
+            <span className="text-[11px]" style={{ color: 'var(--faint)' }}>
+              {card.platform} · {timeAgo(card.last_seen_at)}
+            </span>
+          </div>
+          <div className="sku-card__detail-row">
+            <div>
+              <div className="kicker">Price</div>
+              <div className="mono text-[22px]" style={{ color: 'var(--ink)' }}>{formatINR(card.price)}</div>
+            </div>
+            <div className="text-right">
+              <div className="kicker">BSR</div>
+              <div className="mono text-[14px]" style={{ color: 'var(--ink-soft)' }}>
+                {card.bsr ? card.bsr.replace(/^#?\s*/, '#').slice(0, 24) : '—'}
+              </div>
+            </div>
+          </div>
+          <div className="sku-card__detail-row">
+            <div>
+              <div className="kicker">Rating</div>
+              <div className="text-[13px]" style={{ color: 'var(--ink-soft)' }}>
+                {card.rating != null ? <>★ {card.rating.toFixed(1)}</> : '—'}
+                <span className="mono ml-2 text-[12px]" style={{ color: 'var(--faint)' }}>
+                  {card.reviews != null ? card.reviews.toLocaleString('en-IN') : '—'}
+                </span>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="kicker">Stock</div>
+              <div className="text-[13px]" style={{ color: card.in_stock === false ? 'var(--accent-red)' : 'var(--ink-soft)' }}>
+                {card.in_stock === false ? 'Out' : card.in_stock === true ? 'In stock' : '—'}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="sku-card__body">
+          <div className="flex items-center justify-between gap-2">
+            <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{card.asin_or_sku}</span>
+            <span className="text-[11px]" style={{ color: 'var(--faint)' }}>{card.changes.length} changes</span>
+          </div>
+
+          <div className="serif text-[18px] leading-tight sku-card__title" style={{ color: 'var(--ink)' }} title={card.title}>
+            {card.title}
+          </div>
+
+          <div className="flex flex-wrap gap-1.5">
+            {(['title', 'description', 'bsr', 'price'] as ChangeKind[]).map((k) => {
+              const ch = card.changeFlags[k];
+              if (ch) {
+                const ins = summarizeChange(ch);
+                return (
+                  <span key={k} className={chipToneClass(ins.tone)} title={`${ins.label}: ${ins.summary}`}>
+                    {CHANGE_LABEL[k]}
+                  </span>
+                );
+              }
+              return (
+                <span
+                  key={k}
+                  className="chip"
+                  style={{ opacity: 0.45 }}
+                  title={`No ${CHANGE_LABEL[k]} change since last scrape`}
+                >
+                  {CHANGE_LABEL[k]}
+                </span>
+              );
+            })}
+          </div>
+
+          {card.pools.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {card.pools.slice(0, 3).map((p) => (
+                <span key={p} className="chip-platform">{p}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      </button>
+
+      <div className="sku-card__foot">
+        <button
+          className="btn-ghost btn !py-[6px] !px-3 !text-[12px]"
+          disabled={busy}
+          onClick={(e) => { e.stopPropagation(); onCheck(); }}
+        >
+          {busy ? '…' : 'Re-scan'}
+        </button>
+        <a
+          href={card.url}
+          target="_blank"
+          rel="noreferrer"
+          className="link-quiet text-[12px]"
+          onClick={(e) => e.stopPropagation()}
+        >
+          Open ↗
+        </a>
+        <span className="ml-auto text-[11px]" style={{ color: 'var(--faint)' }}>
+          {expanded ? 'Click to collapse' : 'Click to expand'}
+        </span>
+      </div>
+
+      {expanded && (
+        <Expanded card={card} sellerBusy={sellerBusy} onRefreshSellers={onRefreshSellers} />
+      )}
+    </article>
   );
 }
 
@@ -427,14 +566,22 @@ function Expanded({
 
   return (
     <div className="sku-card__expand">
-      {/* Changes */}
+      {card.description && (
+        <section className="space-y-2">
+          <div className="kicker">Description</div>
+          <p className="text-[13px] leading-relaxed" style={{ color: 'var(--muted)' }}>
+            {card.description.length > 480 ? `${card.description.slice(0, 480)}…` : card.description}
+          </p>
+        </section>
+      )}
+
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <div className="kicker">Recent changes</div>
           <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{card.changes.length}</span>
         </div>
         {card.changes.length === 0 ? (
-          <div className="text-[13px]" style={{ color: 'var(--muted)' }}>No detected changes yet.</div>
+          <div className="text-[13px]" style={{ color: 'var(--muted)' }}>No detected changes since last scrape.</div>
         ) : (
           <div className="flex flex-wrap gap-2">
             {card.changes.map((ch, i) => {
@@ -456,56 +603,57 @@ function Expanded({
         )}
       </section>
 
-      {/* Sellers */}
-      <section className="space-y-3">
-        <div className="flex items-center justify-between gap-2">
-          <div className="kicker">Other sellers</div>
-          <div className="flex items-center gap-3">
-            <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>
-              {sellers.length ? `${sellers.length} offer${sellers.length === 1 ? '' : 's'}` : 'none cached'}
-            </span>
-            {card.platform === 'amazon' && (
-              <button
-                className="btn-ghost btn !py-[5px] !px-3 !text-[11px]"
-                onClick={(e) => { e.stopPropagation(); onRefreshSellers(); }}
-                disabled={sellerBusy}
-              >
-                {sellerBusy ? 'Fetching…' : 'Refresh'}
-              </button>
-            )}
+      {card.is_own && (
+        <section className="space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="kicker">Other sellers</div>
+            <div className="flex items-center gap-3">
+              <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>
+                {sellers.length ? `${sellers.length} offer${sellers.length === 1 ? '' : 's'}` : 'none cached'}
+              </span>
+              {card.platform === 'amazon' && (
+                <button
+                  className="btn-ghost btn !py-[5px] !px-3 !text-[11px]"
+                  onClick={(e) => { e.stopPropagation(); onRefreshSellers(); }}
+                  disabled={sellerBusy}
+                >
+                  {sellerBusy ? 'Fetching…' : 'Refresh'}
+                </button>
+              )}
+            </div>
           </div>
-        </div>
 
-        {sellers.length === 0 ? (
-          <div className="text-[13px]" style={{ color: 'var(--muted)' }}>
-            {card.platform === 'amazon'
-              ? 'No seller offers cached. Click Refresh to scrape the offer-listing page.'
-              : 'Seller scraping is currently only supported for Amazon.'}
-          </div>
-        ) : (
-          <div className="seller-list">
-            {sellers.map((s, i) => {
-              const isBest = lowestPrice != null && s.price === lowestPrice;
-              return (
-                <div key={i} className={`seller-row ${isBest ? 'seller-row--best' : ''}`}>
-                  <div className="seller-row__name">
-                    <span className="serif text-[16px]" style={{ color: 'var(--ink)' }}>
-                      {s.seller_name}
-                    </span>
-                    <div className="flex items-center gap-1.5 mt-1 flex-wrap">
-                      {s.is_fba && <span className="chip chip-blue">Fulfilled by Amazon</span>}
-                      {s.prime_eligible && !s.is_fba && <span className="chip chip-blue">Prime</span>}
-                      {s.condition && <span className="chip">{s.condition}</span>}
-                      {isBest && <span className="chip chip-green">Lowest</span>}
+          {sellers.length === 0 ? (
+            <div className="text-[13px]" style={{ color: 'var(--muted)' }}>
+              {card.platform === 'amazon'
+                ? 'No seller offers cached. Click Refresh to scrape.'
+                : 'Seller scraping is currently only supported for Amazon.'}
+            </div>
+          ) : (
+            <div className="seller-list">
+              {sellers.map((s, i) => {
+                const isBest = lowestPrice != null && s.price === lowestPrice;
+                return (
+                  <div key={i} className={`seller-row ${isBest ? 'seller-row--best' : ''}`}>
+                    <div className="seller-row__name">
+                      <span className="serif text-[16px]" style={{ color: 'var(--ink)' }}>
+                        {s.seller_name}
+                      </span>
+                      <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                        {s.is_fba && <span className="chip chip-blue">Fulfilled by Amazon</span>}
+                        {s.prime_eligible && !s.is_fba && <span className="chip chip-blue">Prime</span>}
+                        {s.condition && <span className="chip">{s.condition}</span>}
+                        {isBest && <span className="chip chip-green">Lowest</span>}
+                      </div>
                     </div>
+                    <div className="seller-row__price mono">{formatINR(s.price)}</div>
                   </div>
-                  <div className="seller-row__price mono">{formatINR(s.price)}</div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }

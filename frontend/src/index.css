@@ -407,6 +407,29 @@ body {
       radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,0.04), transparent 70%),
       #0a0a0a;
   }
+  .sku-card__detail-strip {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px 18px 14px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.025), transparent 70%),
+      rgba(255,255,255,0.012);
+    border-bottom: 1px solid var(--line);
+  }
+  .sku-card__detail-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .sku-card--expanded .sku-card__detail-strip {
+    width: 320px;
+    flex-shrink: 0;
+    border-bottom: 0;
+    border-right: 1px solid var(--line);
+    padding: 22px 24px;
+  }
   .sku-card__platform {
     position: absolute;
     top: 12px;

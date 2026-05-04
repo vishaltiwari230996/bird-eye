@@ -13,6 +13,13 @@ import asyncio
 import sys
 from dotenv import load_dotenv
 
+# Force UTF-8 stdout/stderr on Windows so unicode prints don't crash
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 load_dotenv()
 
 from database import query
