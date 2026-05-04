@@ -18,7 +18,7 @@ import re
 from typing import Optional
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -222,7 +222,131 @@ def parse_price(raw: str) -> Optional[float]:
     return float(m.group()) if m else None
 
 
-def is_blocked(html: str) -> bool:
+# ─── AI-powered extraction helpers ───────────────────────────────────────────
+
+def _extract_product_zone(html: str) -> str:
+    """Strip nav/footer/ads; keep only the product content zone for LLM context."""
+    soup = BeautifulSoup(html, "html.parser")
+    # Remove noisy sections
+    for tag in soup.find_all(["nav", "header", "footer", "script", "style", "noscript"]):
+        tag.decompose()
+    for tag in soup.find_all(id=re.compile(r"nav|navbar|breadcrumb|sidebar|footer|ad|sponsored", re.I)):
+        tag.decompose()
+
+    # Prefer the product detail area
+    zone = (
+        soup.find(id="dp-container")
+        or soup.find(id="ppd")
+        or soup.find(id="centerCol")
+        or soup.find(id="dp")
+        or soup.body
+    )
+    if not zone:
+        return soup.get_text(" ", strip=True)[:6000]
+
+    # Return clean text, max 6000 chars (fits in ~2k tokens)
+    text = zone.get_text(" ", strip=True)
+    return re.sub(r"\s{2,}", " ", text)[:6000]
+
+
+def _extract_offer_zone(html: str) -> str:
+    """Extract AOD offer panel text for LLM parsing."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(["script", "style", "noscript"]):
+        tag.decompose()
+    zone = (
+        soup.find(id="aod-offer-list")
+        or soup.find(id="aod-container")
+        or soup.find(id="aod-pinned-offer")
+        or soup.body
+    )
+    text = zone.get_text(" ", strip=True) if zone else soup.get_text(" ", strip=True)
+    return re.sub(r"\s{2,}", " ", text)[:5000]
+
+
+async def ai_extract_product(html: str) -> Optional[dict]:
+    """Use OpenRouter LLM to extract product data when CSS selectors fail."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return None
+
+    zone_text = _extract_product_zone(html)
+    model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")
+
+    prompt = (
+        "You are an expert at reading Amazon India product pages. "
+        "Extract the following fields from the text below and return ONLY a JSON object with no extra text:\n"
+        '{"title": string|null, "price": number|null, "rating": number|null, '
+        '"reviewCount": number|null, "availability": string|null, '
+        '"seller": string|null, "bsr": string|null}\n\n'
+        "Rules:\n"
+        "- price is the current selling price in INR as a plain number (no ₹ symbol)\n"
+        "- rating is out of 5 as a decimal (e.g. 4.3)\n"
+        "- bsr is the Best Sellers Rank e.g. '#1,234'\n"
+        "- Return null for any field you cannot find\n\n"
+        f"PAGE TEXT:\n{zone_text}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+            )
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"].strip()
+            # Strip markdown code fences if present
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.DOTALL).strip()
+            data = json.loads(content)
+            print(f"[ai_extract] Product extraction succeeded: title={data.get('title', '')[:40]}")
+            return data
+    except Exception as e:
+        print(f"[ai_extract] Product extraction failed: {e}")
+        return None
+
+
+async def ai_extract_offers(html: str, asin: str) -> list[dict]:
+    """Use OpenRouter LLM to extract seller offer listings when AOD parsing fails."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return []
+
+    zone_text = _extract_offer_zone(html)
+    model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")
+
+    prompt = (
+        "You are an expert at reading Amazon India seller offer listings. "
+        "Extract ALL sellers offering this product and return ONLY a JSON array with no extra text:\n"
+        '[{"seller_name": string, "price": number|null, "condition": string, '
+        '"is_fba": boolean, "prime_eligible": boolean}]\n\n'
+        "Rules:\n"
+        "- price is in INR as a plain number\n"
+        "- condition is usually 'New'\n"
+        "- is_fba is true if sold/fulfilled by Amazon\n"
+        "- Return [] if no sellers found\n\n"
+        f"PAGE TEXT:\n{zone_text}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+            )
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"].strip()
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.DOTALL).strip()
+            listings = json.loads(content)
+            if isinstance(listings, list):
+                print(f"[ai_extract] Offer extraction succeeded: {len(listings)} sellers for {asin}")
+                return listings
+    except Exception as e:
+        print(f"[ai_extract] Offer extraction failed for {asin}: {e}")
+    return []
+
+
     """Detect all known Amazon bot/CAPTCHA/redirect block patterns."""
     if not html or len(html) < 500:
         return True
@@ -590,9 +714,11 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
 
     Priority:
     1. Browser: open product page, click AOD ingress, parse AOD panel
-    2. Static warm-session AOD AJAX fallback (often 404 in 2026)
+    2. Static warm-session AOD AJAX fallback
+    3. AI extraction from whatever HTML we managed to get
     """
     product_url = f"https://www.amazon.in/dp/{asin}"
+    last_html: Optional[str] = None
 
     html = await fetch_html_browser(
         product_url,
@@ -608,6 +734,7 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
         retries=1,
     )
     if html:
+        last_html = html
         listings = parse_aod_html(html)
         if listings:
             return listings
@@ -618,6 +745,8 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
     # Static AOD AJAX fallback
     product_html = await fetch_html_static(product_url)
     if product_html and not is_blocked(product_html):
+        if not last_html:
+            last_html = product_html
         ua = pick_ua()
         client = await get_static_client()
         for aod_url in (
@@ -636,13 +765,22 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
                     },
                 )
                 if r.is_success and not is_blocked(r.text):
+                    last_html = r.text
                     listings = parse_aod_html(r.text)
                     if listings:
                         return listings
             except Exception as e:
                 print(f"[scraper] AOD AJAX fallback failed for {asin}: {e}")
 
+    # AI fallback — extract sellers from whatever page we got
+    if last_html:
+        print(f"[scraper] CSS offer parsing failed for {asin}, trying AI extraction")
+        ai_listings = await ai_extract_offers(last_html, asin)
+        if ai_listings:
+            return ai_listings
+
     return []
+
 
 
 # ─── Product page parser ─────────────────────────────────────────────────────
@@ -810,11 +948,33 @@ def parse_product_page(html: str) -> Optional[dict]:
 # ─── Product scrape ───────────────────────────────────────────────────────────
 
 async def scrape_product(asin: str, url: str) -> Optional[dict]:
-    """Scrape a product page — static with full headers first, browser fallback."""
+    """Scrape a product page.
+
+    Priority:
+    1. Static HTTP (fast, ~90% success)
+    2. Playwright browser (stealth, fallback)
+    3. AI extraction from raw HTML (resilient to DOM changes)
+    """
+    last_html: Optional[str] = None
+
     html = await fetch_html_static(url)
     if html and not is_blocked(html):
         payload = parse_product_page(html)
+        if payload and payload.get("price"):
+            return payload
+        # Selectors returned incomplete data — save html for AI fallback
+        last_html = html
         if payload:
+            # Title found but price missing — try AI to fill gaps
+            ai_data = await ai_extract_product(html)
+            if ai_data:
+                payload["price"] = payload.get("price") or ai_data.get("price")
+                payload["rating"] = payload.get("rating") or ai_data.get("rating")
+                payload["reviewCount"] = payload.get("reviewCount") or ai_data.get("reviewCount")
+                payload["availability"] = payload.get("availability") or ai_data.get("availability")
+                payload["bsr"] = payload.get("bsr") or ai_data.get("bsr")
+                if payload.get("offers"):
+                    payload["offers"]["seller"] = payload["offers"].get("seller") or ai_data.get("seller")
             return payload
 
     await asyncio.sleep(human_delay(1.0, 2.5))
@@ -824,6 +984,40 @@ async def scrape_product(asin: str, url: str) -> Optional[dict]:
         retries=1,
     )
     if html and not is_blocked(html):
-        return parse_product_page(html)
+        last_html = html
+        payload = parse_product_page(html)
+        if payload and payload.get("price"):
+            return payload
+        if payload:
+            # Fill gaps with AI
+            ai_data = await ai_extract_product(html)
+            if ai_data:
+                payload["price"] = payload.get("price") or ai_data.get("price")
+                payload["rating"] = payload.get("rating") or ai_data.get("rating")
+                payload["reviewCount"] = payload.get("reviewCount") or ai_data.get("reviewCount")
+                payload["availability"] = payload.get("availability") or ai_data.get("availability")
+                payload["bsr"] = payload.get("bsr") or ai_data.get("bsr")
+                if payload.get("offers"):
+                    payload["offers"]["seller"] = payload["offers"].get("seller") or ai_data.get("seller")
+            return payload
+
+    # Both static + browser failed or returned no title — pure AI extraction
+    if last_html:
+        print(f"[scraper] CSS selectors failed for {asin}, falling back to full AI extraction")
+        ai_data = await ai_extract_product(last_html)
+        if ai_data and ai_data.get("title"):
+            return {
+                "title": ai_data.get("title"),
+                "price": ai_data.get("price"),
+                "rating": ai_data.get("rating"),
+                "reviewCount": ai_data.get("reviewCount"),
+                "bsr": ai_data.get("bsr"),
+                "currency": "INR",
+                "availability": ai_data.get("availability"),
+                "image": None,
+                "seo": {"bulletCount": 0, "imageCount": 0, "hasAPlus": False},
+                "offers": {"availability": ai_data.get("availability"), "seller": ai_data.get("seller")},
+            }
 
     return None
+
