@@ -1,45 +1,83 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '@/api';
-import { summarizeChange } from '@/lib/change-intel';
-
-interface PoolStat {
-  pool_id: number;
-  pool_name: string;
-  product_count: number;
-  avg_price: number | null;
-  avg_rating: number | null;
-  total_reviews: number | null;
-  in_stock_count: number;
-  aplus_count: number;
-  avg_bullet_count: number | null;
-  avg_image_count: number | null;
-  latest_fetched_at: string | null;
-  is_own_pool: boolean;
-  change_count: number;
-  price_drops: number;
-  price_hikes: number;
-  rating_improved: number;
-  rating_dropped: number;
-}
-
-interface RecentChange {
-  field: string;
-  old_value: string;
-  new_value: string;
-  detected_at: string;
-}
-
-interface Product {
-  id: number;
-  platform: string;
-  asin_or_sku: string;
-  title_known: string | null;
-  url: string;
-  last_snapshot: { payload_json: any } | null;
-  recent_changes: RecentChange[] | null;
-}
 
 type SinceKey = '24h' | '7d' | '30d';
+
+interface Headline {
+  pwCount: number;
+  competitorCount: number;
+  movements: number;
+  hijacksActive: number;
+  since: string;
+}
+
+interface Movement {
+  productId: number;
+  asin: string;
+  url: string;
+  title: string;
+  brand: string;
+  isOwn: boolean;
+  cohort: string;
+  field: string;
+  category: string;
+  label: string;
+  summary: string;
+  tone: 'green' | 'red' | 'amber' | 'blue' | 'gray';
+  score: number;
+  detectedAt: string | null;
+}
+
+interface BrandEntry {
+  brand: string;
+  skuCount: number;
+  avgPrice: number | null;
+  minPrice: number | null;
+  avgBsr: number | null;
+}
+
+interface BattlegroundCohort {
+  cohort: string;
+  brands: BrandEntry[];
+  verdict: string;
+}
+
+interface Hijack {
+  productId: number;
+  asin: string;
+  url: string;
+  title: string;
+  buyboxSeller: string | null;
+  buyboxPrice: number | null;
+  isPwBuybox: boolean;
+  sellerCount: number;
+  lowestCompetitor: string | null;
+  lowestCompetitorPrice: number | null;
+  pwPrice: number | null;
+  undercutBy: number | null;
+  severity: 'high' | 'ok';
+}
+
+interface SeriesPoint {
+  date: string;
+  value: number | null;
+}
+
+interface ReportPayload {
+  headline: Headline;
+  movements: Movement[];
+  battleground: BattlegroundCohort[];
+  hijacks: Hijack[];
+  trends: {
+    pwPrice: SeriesPoint[];
+    competitorPrice: SeriesPoint[];
+    activity: SeriesPoint[];
+  };
+  aiSummary: string;
+  generatedAt: number;
+  cached: boolean;
+  cacheAge: number;
+}
 
 function formatINR(n: number | null | undefined): string {
   if (n == null || Number.isNaN(Number(n))) return '—';
@@ -57,209 +95,375 @@ function timeAgo(iso: string | null): string {
   return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
+function toneClass(tone: Movement['tone']): string {
+  switch (tone) {
+    case 'green': return 'chip chip-green';
+    case 'red': return 'chip chip-red';
+    case 'amber': return 'chip chip-amber';
+    case 'blue': return 'chip chip-blue';
+    default: return 'chip';
+  }
+}
+
+function Sparkline({ data, color = 'var(--ink)', height = 44 }: { data: SeriesPoint[]; color?: string; height?: number }) {
+  const points = data.filter((d): d is { date: string; value: number } => d.value != null);
+  if (points.length < 2) {
+    return <div className="text-[12px]" style={{ color: 'var(--faint)' }}>— insufficient data —</div>;
+  }
+  const values = points.map((p) => p.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const w = 280;
+  const h = height;
+  const stepX = w / (points.length - 1);
+  const path = points
+    .map((p, i) => {
+      const x = i * stepX;
+      const y = h - ((p.value - min) / range) * (h - 6) - 3;
+      return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(' ');
+  const last = points[points.length - 1];
+  const first = points[0];
+  const delta = last.value - first.value;
+  const pct = first.value !== 0 ? (delta / first.value) * 100 : 0;
+  const trendColor = delta < 0 ? 'var(--accent-green)' : delta > 0 ? 'var(--accent-red)' : 'var(--ink-soft)';
+  return (
+    <div className="flex items-end gap-3">
+      <svg width={w} height={h} style={{ overflow: 'visible' }}>
+        <path d={path} fill="none" stroke={color} strokeWidth="1.6" />
+        <circle cx={(points.length - 1) * stepX} cy={h - ((last.value - min) / range) * (h - 6) - 3} r="2.6" fill={color} />
+      </svg>
+      <div className="text-[12px] mono" style={{ color: trendColor }}>
+        {delta > 0 ? '▲' : delta < 0 ? '▼' : '▬'} {pct.toFixed(1)}%
+      </div>
+    </div>
+  );
+}
+
 export default function Report() {
-  const [since, setSince] = useState<SinceKey>('7d');
-  const [stats, setStats] = useState<PoolStat[]>([]);
-  const [products, setProducts] = useState<Product[]>([]);
+  const [since, setSince] = useState<SinceKey>('24h');
+  const [data, setData] = useState<ReportPayload | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [movementFilter, setMovementFilter] = useState<'all' | 'price' | 'bsr' | 'content'>('all');
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true);
-      try {
-        const [bRes, pRes] = await Promise.all([
-          api.get(`/api/battleground?since=${since}`),
-          api.get('/api/products'),
-        ]);
-        if (!bRes.ok) throw new Error(`HTTP ${bRes.status}`);
-        if (!pRes.ok) throw new Error(`HTTP ${pRes.status}`);
-        setStats(await bRes.json());
-        setProducts(await pRes.json());
-        setError(null);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Failed to load');
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [since]);
-
-  const totals = useMemo(() => {
-    const own = stats.filter((s) => s.is_own_pool);
-    const field = stats.filter((s) => !s.is_own_pool);
-    const sum = (arr: PoolStat[], k: keyof PoolStat) => arr.reduce((a, b) => a + (Number(b[k]) || 0), 0);
-    return {
-      ownProducts: sum(own, 'product_count'),
-      fieldProducts: sum(field, 'product_count'),
-      ownChanges: sum(own, 'change_count'),
-      fieldChanges: sum(field, 'change_count'),
-      ownPriceDrops: sum(own, 'price_drops'),
-      ownPriceHikes: sum(own, 'price_hikes'),
-      fieldPriceDrops: sum(field, 'price_drops'),
-      fieldPriceHikes: sum(field, 'price_hikes'),
-      ownRatingUp: sum(own, 'rating_improved'),
-      ownRatingDown: sum(own, 'rating_dropped'),
-    };
-  }, [stats]);
-
-  const cutoffMs = useMemo(() => {
-    const ms: Record<SinceKey, number> = { '24h': 86400000, '7d': 7 * 86400000, '30d': 30 * 86400000 };
-    return Date.now() - ms[since];
-  }, [since]);
-
-  const timeline = useMemo(() => {
-    const events: { product: Product; change: RecentChange }[] = [];
-    for (const p of products) {
-      for (const c of p.recent_changes ?? []) {
-        if (new Date(c.detected_at).getTime() >= cutoffMs) events.push({ product: p, change: c });
-      }
+  const load = async (force = false) => {
+    if (force) setRefreshing(true);
+    else setLoading(true);
+    try {
+      const res = await api.get(`/api/report?since=${since}${force ? '&refresh=true' : ''}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setData(await res.json());
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load');
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
     }
-    events.sort((a, b) => new Date(b.change.detected_at).getTime() - new Date(a.change.detected_at).getTime());
-    return events.slice(0, 40);
-  }, [products, cutoffMs]);
+  };
+
+  useEffect(() => { load(); }, [since]);
+
+  const filteredMovements = useMemo(() => {
+    if (!data) return [];
+    if (movementFilter === 'all') return data.movements;
+    return data.movements.filter((m) => {
+      if (movementFilter === 'price') return m.category === 'price';
+      if (movementFilter === 'bsr') return m.category === 'bsr';
+      if (movementFilter === 'content') return m.category === 'content';
+      return true;
+    });
+  }, [data, movementFilter]);
 
   return (
     <div className="space-y-12">
+      {/* HERO */}
       <section className="flex items-end justify-between gap-10 flex-wrap">
         <div className="max-w-2xl space-y-4">
-          <div className="kicker">Period Brief</div>
+          <div className="kicker">Executive Briefing</div>
           <h1 className="serif text-[68px] leading-[0.95] tracking-tight" style={{ color: 'var(--ink)' }}>
             Report
           </h1>
           <p className="text-[16px] leading-relaxed" style={{ color: 'var(--muted)' }}>
-            What moved, where it moved, and how PW stands against the field.
+            What moved overnight. Where PW stands. What leadership should know first.
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {(['24h', '7d', '30d'] as SinceKey[]).map((k) => (
-            <button key={k} className={`pill ${since === k ? 'active' : ''}`} onClick={() => setSince(k)}>
-              {k}
-            </button>
+            <button key={k} className={`pill ${since === k ? 'active' : ''}`} onClick={() => setSince(k)}>{k}</button>
           ))}
+          <button
+            className="btn"
+            onClick={() => load(true)}
+            disabled={refreshing}
+            title="Force refresh (skip cache)"
+          >
+            {refreshing ? 'Refreshing…' : 'Refresh'}
+          </button>
         </div>
       </section>
 
-      {loading && <div className="panel p-10 text-center" style={{ color: 'var(--muted)' }}>Loading report…</div>}
+      {loading && <div className="panel p-10 text-center" style={{ color: 'var(--muted)' }}>Compiling briefing…</div>}
       {error && !loading && <div className="panel p-6" style={{ color: 'var(--accent-red)' }}>{error}</div>}
 
-      {!loading && !error && (
+      {data && !loading && (
         <>
-          {/* HEADLINE METRICS */}
+          {/* HEADLINE STRIP */}
           <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div className="stat-card">
               <div className="kicker">PW SKUs</div>
-              <div className="serif text-[42px]" style={{ color: 'var(--ink)' }}>{totals.ownProducts}</div>
+              <div className="serif text-[42px]" style={{ color: 'var(--ink)' }}>{data.headline.pwCount}</div>
               <div className="text-[12px]" style={{ color: 'var(--muted)' }}>tracked</div>
             </div>
             <div className="stat-card">
-              <div className="kicker">Field SKUs</div>
-              <div className="serif text-[42px]" style={{ color: 'var(--ink)' }}>{totals.fieldProducts}</div>
+              <div className="kicker">Competitor SKUs</div>
+              <div className="serif text-[42px]" style={{ color: 'var(--ink)' }}>{data.headline.competitorCount}</div>
               <div className="text-[12px]" style={{ color: 'var(--muted)' }}>tracked</div>
             </div>
             <div className="stat-card">
-              <div className="kicker">PW Changes</div>
-              <div className="serif text-[42px]" style={{ color: 'var(--ink)' }}>{totals.ownChanges}</div>
+              <div className="kicker">Movements</div>
+              <div className="serif text-[42px]" style={{ color: 'var(--ink)' }}>{data.headline.movements}</div>
               <div className="text-[12px]" style={{ color: 'var(--muted)' }}>last {since}</div>
             </div>
             <div className="stat-card">
-              <div className="kicker">Field Changes</div>
-              <div className="serif text-[42px]" style={{ color: 'var(--ink)' }}>{totals.fieldChanges}</div>
-              <div className="text-[12px]" style={{ color: 'var(--muted)' }}>last {since}</div>
+              <div className="kicker">Hijacks open</div>
+              <div className="serif text-[42px]" style={{ color: data.headline.hijacksActive > 0 ? 'var(--accent-red)' : 'var(--ink)' }}>
+                {data.headline.hijacksActive}
+              </div>
+              <div className="text-[12px]" style={{ color: 'var(--muted)' }}>need action</div>
             </div>
           </section>
 
-          {/* PRICE / RATING MOVEMENTS */}
-          <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="panel p-6 space-y-4">
-              <div className="kicker">Price Movement</div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <div className="kicker">PW</div>
-                  <div className="text-[14px] mt-2 space-y-1">
-                    <div><span style={{ color: 'var(--accent-green)' }}>↓ {totals.ownPriceDrops}</span> drops</div>
-                    <div><span style={{ color: 'var(--accent-red)' }}>↑ {totals.ownPriceHikes}</span> hikes</div>
-                  </div>
-                </div>
-                <div>
-                  <div className="kicker">Field</div>
-                  <div className="text-[14px] mt-2 space-y-1">
-                    <div><span style={{ color: 'var(--accent-green)' }}>↓ {totals.fieldPriceDrops}</span> drops</div>
-                    <div><span style={{ color: 'var(--accent-red)' }}>↑ {totals.fieldPriceHikes}</span> hikes</div>
-                  </div>
-                </div>
+          {/* AI SUMMARY */}
+          {data.aiSummary && (
+            <section className="panel p-7 space-y-4" style={{ borderColor: 'var(--line-strong)' }}>
+              <div className="flex items-center justify-between">
+                <div className="kicker">AI Briefing</div>
+                <span className="text-[11px]" style={{ color: 'var(--faint)' }}>
+                  {data.cached ? `cached ${Math.floor(data.cacheAge / 60)}m ago` : 'fresh'}
+                </span>
+              </div>
+              <ul className="space-y-3">
+                {data.aiSummary.split('\n').filter((s) => s.trim()).map((line, i) => (
+                  <li key={i} className="flex gap-3 items-start">
+                    <span className="serif text-[20px]" style={{ color: 'var(--accent-amber, #d4a857)' }}>›</span>
+                    <span className="text-[15px] leading-relaxed" style={{ color: 'var(--ink-soft)' }}>
+                      {line.replace(/^[-•›\d.\s]+/, '').trim()}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {/* MOVEMENTS FEED */}
+          <section className="space-y-4">
+            <div className="flex items-end justify-between flex-wrap gap-3">
+              <div>
+                <div className="kicker">What changed</div>
+                <h2 className="serif text-[32px] leading-tight" style={{ color: 'var(--ink)' }}>
+                  Movements <span style={{ color: 'var(--faint)' }}>· {filteredMovements.length}</span>
+                </h2>
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {(['all', 'price', 'bsr', 'content'] as const).map((k) => (
+                  <button
+                    key={k}
+                    className={`pill ${movementFilter === k ? 'active' : ''}`}
+                    onClick={() => setMovementFilter(k)}
+                  >
+                    {k}
+                  </button>
+                ))}
               </div>
             </div>
-            <div className="panel p-6 space-y-4">
-              <div className="kicker">PW Rating Movement</div>
-              <div className="text-[14px] mt-2 space-y-1">
-                <div><span style={{ color: 'var(--accent-green)' }}>↑ {totals.ownRatingUp}</span> improved</div>
-                <div><span style={{ color: 'var(--accent-red)' }}>↓ {totals.ownRatingDown}</span> declined</div>
+
+            {filteredMovements.length === 0 ? (
+              <div className="panel p-6 text-center" style={{ color: 'var(--muted)' }}>
+                No movements in this window.
               </div>
-            </div>
-          </section>
-
-          {/* COHORT TABLE */}
-          <section className="space-y-3">
-            <div className="kicker">By cohort</div>
-            <div
-              className="grid items-center gap-6 px-6 py-2"
-              style={{ gridTemplateColumns: 'minmax(0,2fr) 80px 90px 110px 110px 130px 130px' }}
-            >
-              <div className="col-head">Cohort</div>
-              <div className="col-head">Side</div>
-              <div className="col-head">SKUs</div>
-              <div className="col-head">Avg Price</div>
-              <div className="col-head">Avg ★</div>
-              <div className="col-head">Changes</div>
-              <div className="col-head">Last Seen</div>
-            </div>
-            {stats.map((s) => (
-              <article key={s.pool_id} className="row-card">
-                <div
-                  className="grid items-center gap-6 px-6 py-4"
-                  style={{ gridTemplateColumns: 'minmax(0,2fr) 80px 90px 110px 110px 130px 130px' }}
-                >
-                  <div className="serif text-[18px] truncate" style={{ color: 'var(--ink)' }}>{s.pool_name}</div>
-                  <div><span className={s.is_own_pool ? 'chip chip-blue' : 'chip'}>{s.is_own_pool ? 'PW' : 'Field'}</span></div>
-                  <div className="mono text-[14px]">{s.product_count}</div>
-                  <div className="mono text-[14px]">{formatINR(s.avg_price)}</div>
-                  <div className="text-[14px]">{s.avg_rating != null ? `★ ${Number(s.avg_rating).toFixed(2)}` : '—'}</div>
-                  <div className="mono text-[14px]" style={{ color: 'var(--ink-soft)' }}>{s.change_count}</div>
-                  <div className="text-[12px]" style={{ color: 'var(--muted)' }}>{timeAgo(s.latest_fetched_at)}</div>
-                </div>
-              </article>
-            ))}
-          </section>
-
-          {/* TIMELINE */}
-          <section className="space-y-3">
-            <div className="kicker">Activity timeline</div>
-            {!timeline.length ? (
-              <div className="panel p-6 text-center" style={{ color: 'var(--muted)' }}>No changes detected in this window.</div>
             ) : (
               <div className="timeline">
-                {timeline.map((e, i) => {
-                  const ins = summarizeChange(e.change);
-                  const title = e.product.last_snapshot?.payload_json?.title || e.product.title_known || e.product.asin_or_sku;
-                  return (
-                    <div key={i} className="timeline__row">
-                      <div className="timeline__time mono">{timeAgo(e.change.detected_at)}</div>
-                      <div className="timeline__dot" />
-                      <div className="timeline__body">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className={`chip ${ins.tone === 'green' ? 'chip-green' : ins.tone === 'red' ? 'chip-red' : ins.tone === 'amber' ? 'chip-amber' : 'chip-blue'}`}>{ins.label}</span>
-                          <span className="serif text-[16px]" style={{ color: 'var(--ink)' }}>{title}</span>
-                        </div>
-                        <div className="text-[12px]" style={{ color: 'var(--muted)' }}>{ins.summary}</div>
+                {filteredMovements.slice(0, 30).map((m, i) => (
+                  <div key={i} className="timeline__row">
+                    <div className="timeline__time mono">{timeAgo(m.detectedAt)}</div>
+                    <div className="timeline__dot" />
+                    <div className="timeline__body">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={toneClass(m.tone)}>{m.label}</span>
+                        <span className={m.isOwn ? 'chip chip-blue' : 'chip'}>{m.brand}</span>
+                        {m.cohort && <span className="chip-platform">{m.cohort}</span>}
+                        <a href={m.url} target="_blank" rel="noreferrer" className="serif text-[16px] link-quiet" style={{ color: 'var(--ink)' }}>
+                          {m.title.length > 70 ? `${m.title.slice(0, 70)}…` : m.title}
+                        </a>
                       </div>
+                      <div className="text-[13px] mt-1" style={{ color: 'var(--muted)' }}>{m.summary}</div>
                     </div>
-                  );
-                })}
+                  </div>
+                ))}
               </div>
             )}
           </section>
+
+          {/* COHORT BATTLEGROUND */}
+          <section className="space-y-4">
+            <div>
+              <div className="kicker">Cohort battleground</div>
+              <h2 className="serif text-[32px] leading-tight" style={{ color: 'var(--ink)' }}>
+                PW vs the field
+              </h2>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              {data.battleground.map((c) => (
+                <article key={c.cohort} className="panel p-6 space-y-4">
+                  <div className="flex items-baseline justify-between">
+                    <h3 className="serif text-[22px]" style={{ color: 'var(--ink)' }}>{c.cohort}</h3>
+                    <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>
+                      {c.brands.reduce((a, b) => a + b.skuCount, 0)} SKUs
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    {c.brands.map((b) => {
+                      const pwBenchmark = c.brands.find((x) => x.brand === 'PW')?.avgPrice;
+                      const isPw = b.brand === 'PW';
+                      const cheaper = !isPw && pwBenchmark != null && b.avgPrice != null && b.avgPrice < pwBenchmark;
+                      return (
+                        <div key={b.brand} className="flex items-center justify-between gap-3 py-2" style={{ borderBottom: '1px solid var(--line)' }}>
+                          <div className="flex items-center gap-2">
+                            <span className={isPw ? 'chip chip-blue' : 'chip'}>{b.brand}</span>
+                            <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{b.skuCount}</span>
+                          </div>
+                          <div className="flex items-center gap-4">
+                            <div className="text-right">
+                              <div className="kicker">avg ₹</div>
+                              <div className="mono text-[14px]" style={{ color: cheaper ? 'var(--accent-red)' : 'var(--ink)' }}>
+                                {formatINR(b.avgPrice)}
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              <div className="kicker">avg BSR</div>
+                              <div className="mono text-[13px]" style={{ color: 'var(--ink-soft)' }}>
+                                {b.avgBsr != null ? `#${b.avgBsr.toLocaleString()}` : '—'}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {c.verdict && (
+                    <div className="text-[13px] italic" style={{ color: 'var(--muted)' }}>
+                      {c.verdict}
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          </section>
+
+          {/* HIJACK / BUYBOX */}
+          <section className="space-y-4">
+            <div>
+              <div className="kicker">Hijack & buybox health</div>
+              <h2 className="serif text-[32px] leading-tight" style={{ color: 'var(--ink)' }}>
+                PW listings under pressure
+              </h2>
+            </div>
+            {data.hijacks.length === 0 ? (
+              <div className="panel p-6 text-center" style={{ color: 'var(--muted)' }}>
+                No PW seller data yet — run "Fetch all PW sellers" on the Products page.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div
+                  className="grid items-center gap-4 px-5 py-2"
+                  style={{ gridTemplateColumns: 'minmax(0,2fr) 1.4fr 100px 110px 110px 110px' }}
+                >
+                  <div className="col-head">Listing</div>
+                  <div className="col-head">Buybox</div>
+                  <div className="col-head">Sellers</div>
+                  <div className="col-head">PW ₹</div>
+                  <div className="col-head">Lowest comp</div>
+                  <div className="col-head">Status</div>
+                </div>
+                {data.hijacks.slice(0, 30).map((h) => (
+                  <article
+                    key={h.productId}
+                    className="row-card"
+                    style={{
+                      borderColor: h.severity === 'high' ? 'var(--accent-red)' : undefined,
+                      background: h.severity === 'high' ? 'rgba(232,148,132,0.05)' : undefined,
+                    }}
+                  >
+                    <div
+                      className="grid items-center gap-4 px-5 py-3"
+                      style={{ gridTemplateColumns: 'minmax(0,2fr) 1.4fr 100px 110px 110px 110px' }}
+                    >
+                      <a
+                        href={h.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="serif text-[15px] truncate link-quiet"
+                        style={{ color: 'var(--ink)' }}
+                        title={h.title}
+                      >
+                        {h.title}
+                      </a>
+                      <div className="text-[13px] truncate" style={{ color: h.isPwBuybox ? 'var(--ink-soft)' : 'var(--accent-red)' }}>
+                        {h.buyboxSeller || '—'}
+                      </div>
+                      <div className="mono text-[13px]">{h.sellerCount}</div>
+                      <div className="mono text-[13px]">{formatINR(h.pwPrice)}</div>
+                      <div className="mono text-[13px]">{formatINR(h.lowestCompetitorPrice)}</div>
+                      <div>
+                        {h.severity === 'high' ? (
+                          <span className="chip chip-red">
+                            {!h.isPwBuybox ? 'Hijacked' : 'Undercut'}
+                          </span>
+                        ) : (
+                          <span className="chip chip-green">OK</span>
+                        )}
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* TRENDS */}
+          <section className="space-y-4">
+            <div>
+              <div className="kicker">30-day trends</div>
+              <h2 className="serif text-[32px] leading-tight" style={{ color: 'var(--ink)' }}>
+                The long view
+              </h2>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+              <div className="panel p-6 space-y-3">
+                <div className="kicker">PW avg price</div>
+                <Sparkline data={data.trends.pwPrice} color="var(--ink)" />
+              </div>
+              <div className="panel p-6 space-y-3">
+                <div className="kicker">Competitor avg price</div>
+                <Sparkline data={data.trends.competitorPrice} color="var(--ink-soft)" />
+              </div>
+              <div className="panel p-6 space-y-3">
+                <div className="kicker">Daily change activity</div>
+                <Sparkline data={data.trends.activity} color="var(--accent-amber, #d4a857)" />
+              </div>
+            </div>
+          </section>
+
+          <div className="text-[11px] text-right" style={{ color: 'var(--faint)' }}>
+            Generated {timeAgo(new Date(data.generatedAt * 1000).toISOString())}
+            {data.cached ? ` · cache age ${Math.floor(data.cacheAge / 60)}m` : ''}
+          </div>
         </>
       )}
     </div>
