@@ -1,0 +1,62 @@
+# cloudbuild.yaml — builds the Docker image and deploys to Cloud Run.
+#
+# Usage (one-time manual trigger):
+#   gcloud builds submit --config backend/cloudbuild.yaml backend/
+#
+# Or connect this repo to Cloud Build triggers for auto-deploy on push.
+#
+# Required substitutions (set in Cloud Build trigger UI or --substitutions flag):
+#   _REGION          e.g. asia-south1
+#   _SERVICE         e.g. birdeye-backend
+#   _IMAGE           e.g. gcr.io/YOUR_PROJECT/birdeye-backend
+
+substitutions:
+  _REGION: asia-south1          # Mumbai — closest to amazon.in
+  _SERVICE: birdeye-backend
+  _IMAGE: gcr.io/$PROJECT_ID/birdeye-backend
+
+steps:
+  # 1. Build the container image
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - $_IMAGE:$SHORT_SHA
+      - -t
+      - $_IMAGE:latest
+      - .
+    dir: backend
+
+  # 2. Push to Container Registry
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - $_IMAGE
+
+  # 3. Deploy to Cloud Run
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - $_SERVICE
+      - --image=$_IMAGE:$SHORT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --allow-unauthenticated
+      - --min-instances=1          # keeps browser warm, avoids cold-start
+      - --max-instances=3
+      - --memory=2Gi               # Chromium needs ~800 MB; 2Gi gives headroom
+      - --cpu=1
+      - --timeout=120              # 2-min request timeout for slow scrapes
+      - --concurrency=4            # limit concurrent scrapes per instance
+      - --set-env-vars=APP_ENV=production
+      - --set-secrets=DATABASE_URL=birdeye-db-url:latest,OPENROUTER_API_KEY=birdeye-openrouter-key:latest,CRON_SECRET=birdeye-cron-secret:latest,FRONTEND_URL=birdeye-frontend-url:latest
+
+images:
+  - $_IMAGE:$SHORT_SHA
+  - $_IMAGE:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY

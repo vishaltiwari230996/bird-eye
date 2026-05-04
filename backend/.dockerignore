@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.env.*
+*.env
+.venv/
+venv/
+env/
+
+# Playwright local browser cache (re-installed in Docker)
+.playwright/
+playwright-report/
+
+# Test / dev artifacts
+*.log
+*.sqlite
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
