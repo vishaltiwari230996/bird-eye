@@ -693,3 +693,79 @@ body {
   background: rgba(168, 122, 42, 0.28);
   color: var(--ink);
 }
+
+/* ─── Marquee credit band (top of layout) ───────────────────────────── */
+.marquee-band {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  background: var(--ink);
+  color: var(--bg);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.4);
+  /* Soft fade on both edges so items never hard-clip */
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 48px, #000 calc(100% - 48px), transparent 100%);
+          mask-image: linear-gradient(90deg, transparent 0, #000 48px, #000 calc(100% - 48px), transparent 100%);
+}
+
+.marquee-track {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  white-space: nowrap;
+  padding: 9px 0;
+  /* The track holds two copies of the list, so translating by -50%
+     loops seamlessly. */
+  animation: marquee-scroll 38s linear infinite;
+  will-change: transform;
+}
+
+.marquee-band:hover .marquee-track {
+  animation-play-state: paused;
+}
+
+.marquee-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 28px;
+  font-family: 'Inter', sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.marquee-label {
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  font-weight: 700;
+  font-size: 10.5px;
+  color: rgba(241, 234, 217, 0.55);
+}
+
+.marquee-sep {
+  color: rgba(241, 234, 217, 0.35);
+}
+
+.marquee-value {
+  color: var(--bg);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.marquee-dot {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(168, 122, 42, 0.85);
+  margin-left: 18px;
+}
+
+@keyframes marquee-scroll {
+  from { transform: translate3d(0, 0, 0); }
+  to   { transform: translate3d(-50%, 0, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marquee-track { animation: none; }
+}
