@@ -647,6 +647,30 @@ body {
     gap: 10px;
     padding-top: 6px;
     border-top: 1px solid var(--line);
+    align-items: end;
+  }
+  .cohort-card__split > div {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    gap: 6px;
+    min-width: 0;
+  }
+  .cohort-card__split .kicker {
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    line-height: 1.25;
+    /* Reserve two lines so "Avg Price" aligns with single-word labels */
+    min-height: 2.5em;
+    display: flex;
+    align-items: flex-start;
+  }
+  .cohort-card__split .metric-val {
+    font-size: 22px;
+    margin-top: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* Timeline */
