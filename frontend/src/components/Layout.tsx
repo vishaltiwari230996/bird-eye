@@ -56,6 +56,7 @@ export default function Layout({ children }: { children: ReactNode }) {
 
           <nav className="flex items-center gap-2">
             <NavLink to="/" end className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>Products</NavLink>
+            <NavLink to="/pw-table" className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>PW Table</NavLink>
             <NavLink to="/cohorts" className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>Cohorts</NavLink>
             <NavLink to="/report" className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>Report</NavLink>
           </nav>

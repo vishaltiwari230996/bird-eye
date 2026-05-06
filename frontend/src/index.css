@@ -673,6 +673,268 @@ body {
     /* No ellipsis — column is now wide enough */
   }
 
+  /* ── SKU Table (replaces card grid on Products page) ─────────────── */
+  .sku-table {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: rgba(255, 252, 244, 0.50);
+    overflow: hidden;
+  }
+  .sku-table__head {
+    display: grid;
+    grid-template-columns:
+      48px              /* expand caret */
+      minmax(0, 2.4fr)  /* title + asin */
+      130px             /* brand / own */
+      110px             /* platform */
+      120px             /* price */
+      96px              /* rating */
+      92px              /* reviews */
+      150px             /* bsr */
+      90px              /* stock */
+      130px             /* changes */
+      120px             /* last seen */
+      120px;            /* actions */
+    gap: 14px;
+    padding: 12px 18px;
+    background: rgba(28, 24, 18, 0.04);
+    border-bottom: 1px solid var(--line);
+    align-items: center;
+  }
+  .sku-table__row {
+    display: grid;
+    grid-template-columns:
+      48px
+      minmax(0, 2.4fr)
+      130px
+      110px
+      120px
+      96px
+      92px
+      150px
+      90px
+      130px
+      120px
+      120px;
+    gap: 14px;
+    align-items: center;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--line);
+    background: transparent;
+    transition: background 160ms ease;
+    text-align: left;
+    width: 100%;
+    border-left: 0;
+    border-right: 0;
+    border-top: 0;
+    cursor: pointer;
+  }
+  .sku-table__row:last-of-type { border-bottom: 0; }
+  .sku-table__row:hover { background: rgba(28, 24, 18, 0.035); }
+  .sku-table__row:focus-visible {
+    outline: 2px solid rgba(28, 24, 18, 0.35);
+    outline-offset: -2px;
+  }
+  .sku-table__row.is-expanded {
+    background: rgba(255, 252, 244, 0.85);
+    border-bottom-color: var(--line-strong);
+  }
+  .sku-table__caret {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    color: var(--muted);
+    transition: transform 160ms ease, color 160ms ease, background 160ms ease;
+    background: rgba(28, 24, 18, 0.04);
+  }
+  .sku-table__row:hover .sku-table__caret { color: var(--ink); }
+  .sku-table__row.is-expanded .sku-table__caret {
+    transform: rotate(90deg);
+    color: var(--ink);
+    background: rgba(28, 24, 18, 0.10);
+  }
+  .sku-table__title {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .sku-table__title-text {
+    font-family: 'Space Grotesk', 'Inter', sans-serif;
+    font-weight: 600;
+    letter-spacing: -0.012em;
+    font-size: 14.5px;
+    color: var(--ink);
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    word-break: break-word;
+  }
+  .sku-table__sub {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .sku-table__cell-num {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 13px;
+    color: var(--ink);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sku-table__cell-mono {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--ink-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sku-table__cell-text {
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sku-table__changes {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+  .sku-table__changes .chip {
+    padding: 2px 8px;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+  }
+  .sku-table__actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .sku-table__expand {
+    grid-column: 1 / -1;
+    border-bottom: 1px solid var(--line);
+    background: rgba(255, 252, 244, 0.92);
+    padding: 22px 28px 26px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    animation: expand-fade 220ms ease;
+  }
+  .sku-table__pager {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 18px;
+    border-top: 1px solid var(--line);
+    background: rgba(28, 24, 18, 0.025);
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .sku-table__pager-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  @media (max-width: 1280px) {
+    .sku-table__head, .sku-table__row {
+      grid-template-columns:
+        40px
+        minmax(0, 2.2fr)
+        110px
+        110px
+        100px
+        80px
+        130px
+        110px
+        110px;
+      gap: 10px;
+    }
+    .sku-table__hide-md { display: none !important; }
+  }
+
+  /* ── PW Table (categorized PW-only listings) ─────────────────────── */
+  .pw-table {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: rgba(255, 252, 244, 0.50);
+    overflow: hidden;
+  }
+  .pw-table__head {
+    display: grid;
+    grid-template-columns:
+      130px              /* asin */
+      minmax(0, 2.6fr)   /* title */
+      120px              /* price */
+      96px               /* rating */
+      96px               /* reviews */
+      150px              /* bsr */
+      80px               /* stock */
+      120px              /* last seen */
+      60px;              /* open */
+    gap: 14px;
+    padding: 12px 18px;
+    background: rgba(28, 24, 18, 0.04);
+    border-bottom: 1px solid var(--line);
+    align-items: center;
+  }
+  .pw-table__row {
+    display: grid;
+    grid-template-columns:
+      130px
+      minmax(0, 2.6fr)
+      120px
+      96px
+      96px
+      150px
+      80px
+      120px
+      60px;
+    gap: 14px;
+    align-items: center;
+    padding: 11px 18px;
+    border-bottom: 1px solid var(--line);
+    transition: background 160ms ease;
+  }
+  .pw-table__row:last-of-type { border-bottom: 0; }
+  .pw-table__row:hover { background: rgba(28, 24, 18, 0.035); }
+  .pw-table__title { min-width: 0; }
+  .pw-table__title-text {
+    font-family: 'Space Grotesk', 'Inter', sans-serif;
+    font-weight: 600;
+    letter-spacing: -0.012em;
+    font-size: 14px;
+    color: var(--ink);
+    line-height: 1.3;
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    word-break: break-word;
+    transition: color 160ms ease;
+  }
+  .pw-table__title-text:hover { color: var(--accent-blue); }
+  .pw-table__open { text-align: right; }
+
   /* Timeline */
   .timeline {
     border-left: 1px solid var(--line);

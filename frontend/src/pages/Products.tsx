@@ -93,6 +93,7 @@ function chipToneClass(tone: ChangeInsight['tone']): string {
 }
 
 const BRAND_ORDER = ['PW', 'Educart', 'Oswaal', 'MTG'];
+const PAGE_SIZE = 50;
 
 function brandFromPoolName(name: string): string {
   const cleaned = name.trim();
@@ -133,11 +134,13 @@ export default function Products() {
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [platform, setPlatform] = useState<'all' | 'amazon' | 'flipkart'>('all');
+  const [ownership, setOwnership] = useState<'all' | 'own' | 'competitor'>('all');
   const [busyAll, setBusyAll] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set());
   const [sellerBusyIds, setSellerBusyIds] = useState<Set<number>>(new Set());
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [pageByBrand, setPageByBrand] = useState<Record<string, number>>({});
 
   const buildCards = (pools: Pool[], products: ProductFull[]): Card[] => {
     const ownIds = new Set<number>();
@@ -164,8 +167,8 @@ export default function Products() {
         : null;
       const changes = p.recent_changes ?? [];
       const insights = changes.slice(0, 3).map(summarizeChange);
-      const pools = poolNamesById.get(p.id) ?? [];
-      const brand = pools.length ? brandFromPoolName(pools[0]) : 'Other';
+      const cardPools = poolNamesById.get(p.id) ?? [];
+      const brand = cardPools.length ? brandFromPoolName(cardPools[0]) : 'Other';
       return {
         id: p.id,
         platform: p.platform,
@@ -181,7 +184,7 @@ export default function Products() {
         last_seen_at: p.last_seen_at,
         is_own: ownIds.has(p.id),
         brand,
-        pools,
+        pools: cardPools,
         changes,
         insights,
         changeFlags: buildChangeFlags(changes),
@@ -271,6 +274,8 @@ export default function Products() {
     const q = search.trim().toLowerCase();
     return cards.filter((c) => {
       if (platform !== 'all' && c.platform !== platform) return false;
+      if (ownership === 'own' && !c.is_own) return false;
+      if (ownership === 'competitor' && c.is_own) return false;
       if (!q) return true;
       return (
         c.title.toLowerCase().includes(q) ||
@@ -279,7 +284,7 @@ export default function Products() {
         c.pools.some((p) => p.toLowerCase().includes(q))
       );
     });
-  }, [cards, search, platform]);
+  }, [cards, search, platform, ownership]);
 
   const grouped = useMemo(() => {
     const map = new Map<string, Card[]>();
@@ -310,6 +315,10 @@ export default function Products() {
     };
   }, [cards]);
 
+  // Reset pagination whenever filters change so we don't paginate past the
+  // newly-truncated brand lists.
+  useEffect(() => { setPageByBrand({}); }, [search, platform, ownership]);
+
   return (
     <div className="space-y-12">
       <section className="flex items-end justify-between gap-10 flex-wrap">
@@ -332,7 +341,7 @@ export default function Products() {
       </section>
 
       <section className="flex items-center justify-between gap-4 flex-wrap">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {(['all', 'amazon', 'flipkart'] as const).map((k) => (
             <button
               key={k}
@@ -340,6 +349,16 @@ export default function Products() {
               onClick={() => setPlatform(k)}
             >
               {k}
+            </button>
+          ))}
+          <span className="mx-2 text-[12px]" style={{ color: 'var(--faint)' }}>·</span>
+          {(['all', 'own', 'competitor'] as const).map((k) => (
+            <button
+              key={k}
+              className={`pill ${ownership === k ? 'active' : ''}`}
+              onClick={() => setOwnership(k)}
+            >
+              {k === 'all' ? 'all SKUs' : k === 'own' ? 'PW only' : 'competitors'}
             </button>
           ))}
         </div>
@@ -372,6 +391,9 @@ export default function Products() {
 
       {!loading && grouped.map(([brand, list]) => {
         const isPw = brand === 'PW';
+        const page = pageByBrand[brand] ?? 1;
+        const visibleCount = Math.min(list.length, page * PAGE_SIZE);
+        const visible = list.slice(0, visibleCount);
         return (
           <section key={brand} className="space-y-5">
             <div className="flex items-end justify-between flex-wrap gap-4">
@@ -396,19 +418,75 @@ export default function Products() {
               )}
             </div>
 
-            <div className="card-grid">
-              {list.map((c) => (
-                <ProductCard
-                  key={c.id}
-                  card={c}
-                  expanded={expandedId === c.id}
-                  busy={busyIds.has(c.id)}
-                  sellerBusy={sellerBusyIds.has(c.id)}
-                  onToggle={() => setExpandedId(expandedId === c.id ? null : c.id)}
-                  onCheck={() => checkOne(c.id)}
-                  onRefreshSellers={() => refreshSellers(c.id)}
-                />
-              ))}
+            <div className="sku-table">
+              <div className="sku-table__head">
+                <div />
+                <div className="col-head">Product</div>
+                <div className="col-head">Type</div>
+                <div className="col-head">Platform</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>Price</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>Rating</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>Reviews</div>
+                <div className="col-head">BSR</div>
+                <div className="col-head">Stock</div>
+                <div className="col-head">Changes</div>
+                <div className="col-head">Last Seen</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>Actions</div>
+              </div>
+
+              {visible.map((c) => {
+                const expanded = expandedId === c.id;
+                return (
+                  <ProductRow
+                    key={c.id}
+                    card={c}
+                    expanded={expanded}
+                    busy={busyIds.has(c.id)}
+                    sellerBusy={sellerBusyIds.has(c.id)}
+                    onToggle={() => setExpandedId(expanded ? null : c.id)}
+                    onCheck={() => checkOne(c.id)}
+                    onRefreshSellers={() => refreshSellers(c.id)}
+                  />
+                );
+              })}
+
+              {list.length > PAGE_SIZE && (
+                <div className="sku-table__pager">
+                  <span>
+                    Showing <span className="mono" style={{ color: 'var(--ink)' }}>{visibleCount}</span> of{' '}
+                    <span className="mono" style={{ color: 'var(--ink)' }}>{list.length}</span>
+                  </span>
+                  <div className="sku-table__pager-actions">
+                    {visibleCount < list.length && (
+                      <button
+                        className="btn-ghost btn !py-[5px] !px-3 !text-[11px]"
+                        onClick={() => setPageByBrand((s) => ({ ...s, [brand]: page + 1 }))}
+                      >
+                        Load {Math.min(PAGE_SIZE, list.length - visibleCount)} more
+                      </button>
+                    )}
+                    {visibleCount < list.length && (
+                      <button
+                        className="btn-ghost btn !py-[5px] !px-3 !text-[11px]"
+                        onClick={() => setPageByBrand((s) => ({
+                          ...s,
+                          [brand]: Math.ceil(list.length / PAGE_SIZE),
+                        }))}
+                      >
+                        Show all
+                      </button>
+                    )}
+                    {visibleCount > PAGE_SIZE && (
+                      <button
+                        className="btn-ghost btn !py-[5px] !px-3 !text-[11px]"
+                        onClick={() => setPageByBrand((s) => ({ ...s, [brand]: 1 }))}
+                      >
+                        Collapse
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </section>
         );
@@ -417,7 +495,7 @@ export default function Products() {
   );
 }
 
-function ProductCard({
+function ProductRow({
   card,
   expanded,
   busy,
@@ -434,117 +512,122 @@ function ProductCard({
   onCheck: () => void;
   onRefreshSellers: () => void;
 }) {
+  const stockClass =
+    card.in_stock === false ? 'chip chip-red'
+    : card.in_stock === true ? 'chip chip-green'
+    : 'chip';
+  const stockLabel =
+    card.in_stock === false ? 'Out'
+    : card.in_stock === true ? 'In'
+    : '—';
+
+  const flagged = (Object.keys(card.changeFlags) as ChangeKind[]).filter((k) => card.changeFlags[k]);
+
   return (
-    <article className={`sku-card ${expanded ? 'sku-card--expanded' : ''}`}>
-      <button type="button" className="sku-card__head" onClick={onToggle} aria-expanded={expanded}>
-        <div className="sku-card__detail-strip">
-          <div className="sku-card__detail-row">
-            <span className="kicker">{card.is_own ? 'PW' : card.brand}</span>
-            <span className="text-[11px]" style={{ color: 'var(--faint)' }}>
-              {card.platform} · {timeAgo(card.last_seen_at)}
-            </span>
-          </div>
-          <div className="sku-card__detail-row">
-            <div>
-              <div className="kicker">Price</div>
-              <div className="mono text-[22px]" style={{ color: 'var(--ink)' }}>{formatINR(card.price)}</div>
-            </div>
-            <div className="text-right">
-              <div className="kicker">BSR</div>
-              <div className="mono text-[14px]" style={{ color: 'var(--ink-soft)' }}>
-                {card.bsr ? card.bsr.replace(/^#?\s*/, '#').slice(0, 24) : '—'}
-              </div>
-            </div>
-          </div>
-          <div className="sku-card__detail-row">
-            <div>
-              <div className="kicker">Rating</div>
-              <div className="text-[13px]" style={{ color: 'var(--ink-soft)' }}>
-                {card.rating != null ? <>★ {card.rating.toFixed(1)}</> : '—'}
-                <span className="mono ml-2 text-[12px]" style={{ color: 'var(--faint)' }}>
-                  {card.reviews != null ? card.reviews.toLocaleString('en-IN') : '—'}
-                </span>
-              </div>
-            </div>
-            <div className="text-right">
-              <div className="kicker">Stock</div>
-              <div className="text-[13px]" style={{ color: card.in_stock === false ? 'var(--accent-red)' : 'var(--ink-soft)' }}>
-                {card.in_stock === false ? 'Out' : card.in_stock === true ? 'In stock' : '—'}
-              </div>
-            </div>
+    <>
+      <button
+        type="button"
+        className={`sku-table__row ${expanded ? 'is-expanded' : ''}`}
+        onClick={onToggle}
+        aria-expanded={expanded}
+      >
+        <div className="sku-table__caret" aria-hidden>
+          <svg width="10" height="10" viewBox="0 0 10 10">
+            <path d="M3 1 L7 5 L3 9" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </div>
+
+        <div className="sku-table__title">
+          <div className="sku-table__title-text" title={card.title}>{card.title}</div>
+          <div className="sku-table__sub">
+            <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{card.asin_or_sku}</span>
+            {card.pools[0] && (
+              <span className="text-[11px]" style={{ color: 'var(--faint)' }}>· {card.pools[0]}</span>
+            )}
           </div>
         </div>
 
-        <div className="sku-card__body">
-          <div className="flex items-center justify-between gap-2">
-            <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{card.asin_or_sku}</span>
-            <span className="text-[11px]" style={{ color: 'var(--faint)' }}>{card.changes.length} changes</span>
-          </div>
+        <div>
+          <span className={`chip ${card.is_own ? 'chip-blue' : ''}`}>
+            {card.is_own ? 'PW' : card.brand}
+          </span>
+        </div>
 
-          <div className="serif text-[18px] leading-tight sku-card__title" style={{ color: 'var(--ink)' }} title={card.title}>
-            {card.title}
-          </div>
+        <div>
+          <span className="chip-platform">{card.platform}</span>
+        </div>
 
-          <div className="flex flex-wrap gap-1.5">
-            {(['title', 'description', 'bsr', 'price'] as ChangeKind[]).map((k) => {
-              const ch = card.changeFlags[k];
-              if (ch) {
-                const ins = summarizeChange(ch);
-                return (
-                  <span key={k} className={chipToneClass(ins.tone)} title={`${ins.label}: ${ins.summary}`}>
-                    {CHANGE_LABEL[k]}
-                  </span>
-                );
-              }
+        <div className="sku-table__cell-num">{formatINR(card.price)}</div>
+
+        <div className="sku-table__cell-num">
+          {card.rating != null ? `★ ${card.rating.toFixed(1)}` : '—'}
+        </div>
+
+        <div className="sku-table__cell-num">
+          {card.reviews != null ? card.reviews.toLocaleString('en-IN') : '—'}
+        </div>
+
+        <div className="sku-table__cell-mono" title={card.bsr ?? undefined}>
+          {card.bsr ? card.bsr.replace(/^#?\s*/, '#') : '—'}
+        </div>
+
+        <div>
+          <span className={stockClass}>{stockLabel}</span>
+        </div>
+
+        <div className="sku-table__changes">
+          {flagged.length === 0 ? (
+            <span className="text-[11px]" style={{ color: 'var(--faint)' }}>—</span>
+          ) : (
+            flagged.slice(0, 3).map((k) => {
+              const ch = card.changeFlags[k]!;
+              const ins = summarizeChange(ch);
               return (
                 <span
                   key={k}
-                  className="chip"
-                  style={{ opacity: 0.45 }}
-                  title={`No ${CHANGE_LABEL[k]} change since last scrape`}
+                  className={chipToneClass(ins.tone)}
+                  title={`${ins.label}: ${ins.summary}`}
                 >
                   {CHANGE_LABEL[k]}
                 </span>
               );
-            })}
-          </div>
-
-          {card.pools.length > 0 && (
-            <div className="flex flex-wrap gap-1.5">
-              {card.pools.slice(0, 3).map((p) => (
-                <span key={p} className="chip-platform">{p}</span>
-              ))}
-            </div>
+            })
           )}
+          {flagged.length > 3 && (
+            <span className="text-[11px]" style={{ color: 'var(--faint)' }}>+{flagged.length - 3}</span>
+          )}
+        </div>
+
+        <div className="sku-table__cell-text">{timeAgo(card.last_seen_at)}</div>
+
+        <div className="sku-table__actions">
+          <button
+            className="btn-ghost btn !py-[5px] !px-3 !text-[11px]"
+            disabled={busy}
+            onClick={(e) => { e.stopPropagation(); onCheck(); }}
+            title="Re-scan this SKU"
+          >
+            {busy ? '…' : 'Re-scan'}
+          </button>
+          <a
+            href={card.url}
+            target="_blank"
+            rel="noreferrer"
+            className="link-quiet text-[12px]"
+            onClick={(e) => e.stopPropagation()}
+            title="Open listing"
+          >
+            ↗
+          </a>
         </div>
       </button>
 
-      <div className="sku-card__foot">
-        <button
-          className="btn-ghost btn !py-[6px] !px-3 !text-[12px]"
-          disabled={busy}
-          onClick={(e) => { e.stopPropagation(); onCheck(); }}
-        >
-          {busy ? '…' : 'Re-scan'}
-        </button>
-        <a
-          href={card.url}
-          target="_blank"
-          rel="noreferrer"
-          className="link-quiet text-[12px]"
-          onClick={(e) => e.stopPropagation()}
-        >
-          Open ↗
-        </a>
-        <span className="ml-auto text-[11px]" style={{ color: 'var(--faint)' }}>
-          {expanded ? 'Click to collapse' : 'Click to expand'}
-        </span>
-      </div>
-
       {expanded && (
-        <Expanded card={card} sellerBusy={sellerBusy} onRefreshSellers={onRefreshSellers} />
+        <div className="sku-table__expand">
+          <Expanded card={card} sellerBusy={sellerBusy} onRefreshSellers={onRefreshSellers} />
+        </div>
       )}
-    </article>
+    </>
   );
 }
 
@@ -565,7 +648,7 @@ function Expanded({
   const lowestPrice = sellers.length && sellers[0].price != null ? sellers[0].price : null;
 
   return (
-    <div className="sku-card__expand">
+    <>
       {card.description && (
         <section className="space-y-2">
           <div className="kicker">Description</div>
@@ -654,6 +737,6 @@ function Expanded({
           )}
         </section>
       )}
-    </div>
+    </>
   );
 }
