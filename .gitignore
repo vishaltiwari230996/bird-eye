@@ -9,3 +9,11 @@ __pycache__/
 *.pyc
 dist/
 node_modules/
+
+# Local debug / scratch artifacts
+backend/_inspect.py
+backend/check_sellers.py
+backend/inspect_olp.py
+backend/debug_*.html
+backend/debug_*.txt
+Use_Eye_Tools.xlsx
