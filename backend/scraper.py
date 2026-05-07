@@ -289,6 +289,87 @@ def parse_price(raw: str) -> Optional[float]:
         return None
 
 
+# Selectors that locate the product *detail* sections of an Amazon page.
+# Used to scope price/MRP/seller extraction so we don't accidentally pick up
+# values from "Customers also bought" / "Frequently bought together" carousels
+# that appear above and below the buy box.
+_DETAIL_ROOT_SELECTORS = (
+    "#centerCol",
+    "#ppd",
+    "#dp-container",
+    "#corePriceDisplay_desktop_feature_div",
+    "#corePrice_feature_div",
+    "#corePrice_desktop",
+    "#apex_desktop",
+    "#apex_desktop_newAccordionRow",
+    "#apex_offerDisplay_desktop",
+    "#desktop_buybox",
+    "#buybox",
+    "#tabular-buybox-container",
+    "#booksHeaderSection",
+    "#price",
+    "#kindle-price",
+)
+
+_CAROUSEL_ID_HINTS = (
+    "sims-",
+    "similarities",
+    "anonCarousel",
+    "desktop-dp-sims",
+    "shoppingAdvice",
+    "sponsoredProducts",
+    "sp_detail",
+    "sp_carousel",
+    "_recommendations",
+    "DAcrt",
+    "buyAgainCarousel",
+    "compareSimilar",
+    "comparisonTable",
+    "amzn-ss-wrap",
+    "HLCXComparisonWidget",
+    "frequentlyBoughtTogether",
+    "valuePick",
+    "productAlert",
+)
+_CAROUSEL_CLASS_HINTS = (
+    "a-carousel",
+    "a-carousel-card",
+    "sims-fbt",
+    "sims-feature",
+    "sponsored-products",
+    "_p13n-zg-list",
+    "_p13n-sc",
+)
+
+
+def _is_inside_carousel(el) -> bool:
+    """True if `el` lives inside a recommendation/carousel/sponsored block."""
+    p = el
+    while p is not None and getattr(p, "name", None):
+        cid = (p.get("id") or "")
+        cls = " ".join(p.get("class") or [])
+        for hint in _CAROUSEL_ID_HINTS:
+            if hint and hint in cid:
+                return True
+        for hint in _CAROUSEL_CLASS_HINTS:
+            if hint and hint in cls:
+                return True
+        p = p.parent
+    return False
+
+
+def _detail_roots(soup) -> list:
+    """Return the list of detail-page root elements present on the page."""
+    roots = []
+    seen = set()
+    for sel in _DETAIL_ROOT_SELECTORS:
+        el = soup.select_one(sel)
+        if el is not None and id(el) not in seen:
+            seen.add(id(el))
+            roots.append(el)
+    return roots
+
+
 def is_blocked(html: str) -> bool:
     """Detect all known Amazon bot/CAPTCHA/redirect block patterns."""
     if not html or len(html) < 500:
@@ -971,8 +1052,20 @@ def parse_legacy_offer_html(html: str) -> list[dict]:
 
 
 def parse_buybox_seller(html: str) -> Optional[dict]:
-    """Extract the single buy-box seller from a product detail page."""
+    """Extract the single buy-box seller from a product detail page.
+
+    Returns None when the product is unavailable or no real buy-box exists
+    — so we don't fabricate a seller from carousels.
+    """
     soup = BeautifulSoup(html, "html.parser")
+
+    # Bail out fast on "Currently unavailable" pages: there is no buybox to
+    # speak of, and falling through would let recommendation carousels leak in.
+    avail_el = soup.find(id="availability") or soup.select_one("#outOfStock")
+    avail_txt = avail_el.get_text(" ", strip=True).lower() if avail_el else ""
+    if "currently unavailable" in avail_txt or "out of stock" in avail_txt:
+        return None
+
     seller_name = None
 
     for sel in ("#sellerProfileTriggerId", "#merchant-info a", "#tabular-buybox-container .tabular-buybox-text"):
@@ -1279,14 +1372,68 @@ def parse_product_page(html: str) -> Optional[dict]:
                     break
 
     if price is None:
-        for span in soup.find_all("span", class_="a-price"):
-            off = span.find("span", class_="a-offscreen")
-            if off:
+        # Restricted fallback: only consider .a-price spans that live inside a
+        # known detail-page container, never inside a carousel/sponsored block.
+        # Without this guard the first "Customers also bought" tile bleeds in
+        # as the SKU price (observed: ₹85.16 captured for an unavailable item).
+        for root in _detail_roots(soup):
+            for span in root.find_all("span", class_="a-price"):
+                if _is_inside_carousel(span):
+                    continue
+                # Skip strike-through prices here — those are MRPs.
+                ancestor_classes = " ".join(
+                    " ".join(p.get("class") or []) for p in span.parents if p.name
+                )
+                if span.get("data-a-strike") == "true" or "a-text-strike" in ancestor_classes:
+                    continue
+                off = span.find("span", class_="a-offscreen")
+                if not off:
+                    continue
                 txt = off.get_text(strip=True)
                 if "₹" in txt or re.search(r"\d{2,}", txt):
-                    price = parse_price(txt)
-                    if price and price > 0:
+                    cand = parse_price(txt)
+                    if cand and cand > 0:
+                        price = cand
                         break
+            if price is not None:
+                break
+
+    # MRP (struck-through "list price"). We capture the highest plausible
+    # struck price within the price block so discount % can be computed
+    # downstream. Skips offscreen prices that aren't inside a strike container,
+    # and ignores anything inside a recommendation carousel.
+    mrp: Optional[float] = None
+    mrp_candidates: list[float] = []
+    detail_roots = _detail_roots(soup)
+    for root in detail_roots:
+        for sel in (
+            "#corePriceDisplay_desktop_feature_div .a-price.a-text-price .a-offscreen",
+            "#corePrice_feature_div .a-price.a-text-price .a-offscreen",
+            ".basisPrice .a-offscreen",
+            "span.priceBlockStrikePriceString",
+            "span[data-a-strike='true'] .a-offscreen",
+            ".a-text-strike .a-offscreen",
+            ".a-price.a-text-price .a-offscreen",
+        ):
+            for el in root.select(sel):
+                if _is_inside_carousel(el):
+                    continue
+                txt = el.get_text(strip=True)
+                if not (re.search(r"\d", txt) and ("₹" in txt or "Rs" in txt or "INR" in txt)):
+                    continue
+                v = parse_price(txt)
+                if v and v > 0:
+                    mrp_candidates.append(v)
+    if mrp_candidates:
+        # Highest strike-through price wins (Amazon sometimes shows multiple)
+        mrp = max(mrp_candidates)
+        # Sanity: MRP must be >= price (otherwise it's just a duplicate price)
+        if price and mrp <= price:
+            mrp = None
+    # If we couldn't find a real buy-box price (item unavailable), drop the
+    # MRP too — a lone MRP without a price is misleading downstream.
+    if price is None:
+        mrp = None
 
     # Rating
     rating: Optional[float] = None
@@ -1398,6 +1545,7 @@ def parse_product_page(html: str) -> Optional[dict]:
     return {
         "title": title,
         "price": price,
+        "mrp": mrp,
         "rating": rating,
         "reviewCount": review_count,
         "bsr": bsr,
