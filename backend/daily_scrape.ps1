@@ -43,7 +43,7 @@ if (Test-Path $lockFile) {
     if ($pidContent) {
         $existing = Get-Process -Id $pidContent -ErrorAction SilentlyContinue
         if ($existing) {
-            Write-Log "previous scrape (pid=$pidContent) still running; skipping"
+            Write-Log "previous scrape (pid=${pidContent}) still running; skipping"
             exit 0
         }
     }
@@ -59,7 +59,7 @@ $lastExit = -1
 try {
     while ($attempt -lt $MAX_ATTEMPTS -and -not $success) {
         $attempt++
-        Write-Log "attempt $attempt/$MAX_ATTEMPTS: launching scrape_pw_sellers.py --resume"
+        Write-Log "attempt ${attempt}/${MAX_ATTEMPTS}: launching scrape_pw_sellers.py --resume"
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName  = 'python'
@@ -85,7 +85,7 @@ try {
         $proc.BeginOutputReadLine()
         $proc.BeginErrorReadLine()
         $childPid = $proc.Id
-        Write-Log "  child pid=$childPid"
+        Write-Log "  child pid=${childPid}"
 
         $killedByWatchdog = $false
         while (-not $proc.HasExited) {
@@ -94,7 +94,7 @@ try {
             $lastWrite = (Get-Item $logFile).LastWriteTime
             $idleSecs  = [math]::Round(((Get-Date) - $lastWrite).TotalSeconds)
             if ($idleSecs -gt $HANG_IDLE_SECS) {
-                Write-Log "  watchdog: log idle ${idleSecs}s > $HANG_IDLE_SECS, killing pid=$childPid"
+                Write-Log "  watchdog: log idle ${idleSecs}s > ${HANG_IDLE_SECS}, killing pid=${childPid}"
                 try { Stop-Process -Id $childPid -Force -ErrorAction Stop } catch {}
                 try {
                     Get-Process chromium -ErrorAction SilentlyContinue |
@@ -112,12 +112,12 @@ try {
         $lastExit = $proc.ExitCode
 
         if ($killedByWatchdog) {
-            Write-Log "attempt $attempt killed by watchdog (hang); will retry"
+            Write-Log "attempt ${attempt} killed by watchdog (hang); will retry"
         } elseif ($lastExit -eq 0) {
-            Write-Log "attempt $attempt finished cleanly (exit=0)"
+            Write-Log "attempt ${attempt} finished cleanly (exit=0)"
             $success = $true
         } else {
-            Write-Log "attempt $attempt failed (exit=$lastExit); will retry"
+            Write-Log "attempt ${attempt} failed (exit=${lastExit}); will retry"
         }
 
         if (-not $success -and $attempt -lt $MAX_ATTEMPTS) {
@@ -139,7 +139,7 @@ finally {
     } | ConvertTo-Json
     Set-Content -Path $statusFile -Value $status -Encoding utf8
 
-    Write-Log "DONE success=$success attempts=$attempt duration=${durationMin}min"
+    Write-Log "DONE success=${success} attempts=${attempt} duration=${durationMin}min"
 }
 
 if ($success) { exit 0 } else { exit 1 }
