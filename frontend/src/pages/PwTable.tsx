@@ -12,6 +12,15 @@ interface Pool {
   products: PoolProductLite[] | null;
 }
 
+interface SellerOffer {
+  seller_name: string;
+  price: number | null;
+  condition?: string | null;
+  is_fba?: boolean | null;
+  prime_eligible?: boolean | null;
+  fetched_at?: string | null;
+}
+
 interface ProductFull {
   id: number;
   platform: string;
@@ -20,6 +29,12 @@ interface ProductFull {
   title_known: string | null;
   last_seen_at: string | null;
   last_snapshot: { payload_json: any; fetched_at: string } | null;
+  seller_offers: SellerOffer[] | null;
+}
+
+interface SellerCell {
+  price: number | null;
+  rawName: string | null;
 }
 
 interface Row {
@@ -28,17 +43,17 @@ interface Row {
   url: string;
   title: string;
   price: number | null;
-  rating: number | null;
-  reviews: number | null;
-  bsr: string | null;
-  in_stock: boolean | null;
-  last_seen_at: string | null;
+  mrp: number | null;
+  cocoblu: SellerCell;
+  repo: SellerCell;
+  pw: SellerCell;
+  totalSellers: number;
   category: string;
-  is_own: boolean;
+  lastSnapshotAt: string | null;
+  offers: SellerOffer[];
 }
 
 // ─── Category rules ──────────────────────────────────────────────────────────
-// Ordered: first match wins. Tuned for the PW Amazon catalogue.
 const CATEGORY_RULES: Array<[string, RegExp]> = [
   ['Notebooks & Stationery', /\bnotebook|spiral|ruled|\bpages\b|stationery|diary/i],
   ['Handwritten Notes', /handwritten|med easy|pankaj sir|sir.{0,20}notes\b/i],
@@ -55,6 +70,8 @@ const CATEGORY_RULES: Array<[string, RegExp]> = [
   ['Question Banks', /question\s*bank|objective\s*book/i],
 ];
 
+const EXCLUDED_CATEGORIES = new Set(['Notebooks & Stationery', 'Other']);
+
 function categorize(title: string): string {
   for (const [name, re] of CATEGORY_RULES) {
     if (re.test(title)) return name;
@@ -63,7 +80,6 @@ function categorize(title: string): string {
 }
 
 const CATEGORY_ORDER = [
-  'Notebooks & Stationery',
   'Handwritten Notes',
   'Mind Maps & Quick Revision',
   'PYQs & Practice',
@@ -76,9 +92,27 @@ const CATEGORY_ORDER = [
   'Classes 6–10 / Foundation',
   'Workbooks & Modules',
   'Question Banks',
-  'Other',
 ];
 
+// ─── Seller matching ─────────────────────────────────────────────────────────
+const SELLER_PATTERNS = {
+  cocoblu: /cocoblu|coco\s*blue/i,
+  repo: /\brepro\b|repro[-\s]*books|reposellable|repo\s*sellable|\brepos?\b/i,
+  pw: /\bpw\b|physics\s*wallah|physicswallah/i,
+} as const;
+
+function pickSeller(offers: SellerOffer[], rx: RegExp): SellerCell {
+  let best: SellerOffer | null = null;
+  for (const o of offers) {
+    if (!o?.seller_name) continue;
+    if (!rx.test(o.seller_name)) continue;
+    if (o.price == null) continue;
+    if (!best || (best.price ?? Infinity) > (o.price ?? Infinity)) best = o;
+  }
+  return { price: best?.price ?? null, rawName: best?.seller_name ?? null };
+}
+
+// ─── Formatting ──────────────────────────────────────────────────────────────
 function timeAgo(iso: string | null): string {
   if (!iso) return '—';
   const t = new Date(iso).getTime();
@@ -96,8 +130,139 @@ function formatINR(n: number | null | undefined): string {
   return `₹${Math.round(n).toLocaleString('en-IN')}`;
 }
 
+function formatPctOff(seller: number | null, base: number | null): string | null {
+  if (seller == null || base == null || base <= 0 || seller >= base) return null;
+  return `-${Math.round(((base - seller) / base) * 100)}%`;
+}
+
+function formatDelta(seller: number | null, ref: number | null): { label: string; tone: 'down' | 'up' | 'flat' } | null {
+  if (seller == null || ref == null) return null;
+  const diff = seller - ref;
+  if (Math.abs(diff) < 1) return { label: '±0', tone: 'flat' };
+  if (diff < 0) return { label: `−₹${Math.round(-diff).toLocaleString('en-IN')}`, tone: 'down' };
+  return { label: `+₹${Math.round(diff).toLocaleString('en-IN')}`, tone: 'up' };
+}
+
 const PAGE_SIZE = 50;
 
+// ─── CSV export helpers ──────────────────────────────────────────────────────
+
+function csvEscape(v: unknown): string {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function normaliseSellerName(name: string): string {
+  return name.trim().replace(/\s+/g, ' ');
+}
+
+/** Build a CSV with one row per SKU and ONE COLUMN PER SELLER carrying the
+ *  discount % that seller offers vs. the SKU's MRP. Also emits price + raw
+ *  seller-name columns so the data is auditable in Excel.
+ */
+function buildPwCsv(rows: Row[]): string {
+  // Discover every unique seller in the current dataset (sorted by frequency
+  // so the most-common sellers land in the leftmost seller columns).
+  const sellerFreq = new Map<string, number>();
+  for (const r of rows) {
+    for (const o of r.offers) {
+      if (!o.seller_name) continue;
+      const name = normaliseSellerName(o.seller_name);
+      sellerFreq.set(name, (sellerFreq.get(name) ?? 0) + 1);
+    }
+  }
+  const sellers = [...sellerFreq.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([name]) => name);
+
+  const baseCols = [
+    'ASIN',
+    'Title',
+    'Category',
+    'URL',
+    'Buy Box Price',
+    'MRP',
+    'Buy Box Discount %',
+    'Total Sellers',
+    'Last Snapshot',
+  ];
+  const sellerCols: string[] = [];
+  for (const s of sellers) {
+    sellerCols.push(
+      `${s} — Price`,
+      `${s} — Discount % off MRP`,
+      `${s} — Discount vs Buy Box`,
+    );
+  }
+  const header = [...baseCols, ...sellerCols];
+
+  const lines: string[] = [header.map(csvEscape).join(',')];
+
+  for (const r of rows) {
+    // One offer per seller — pick the cheapest if the same seller appears
+    // more than once on a SKU (rare but possible for Used + New listings).
+    const offerBySeller = new Map<string, SellerOffer>();
+    for (const o of r.offers) {
+      if (!o.seller_name) continue;
+      const name = normaliseSellerName(o.seller_name);
+      const cur = offerBySeller.get(name);
+      if (!cur) { offerBySeller.set(name, o); continue; }
+      if ((o.price ?? Infinity) < (cur.price ?? Infinity)) offerBySeller.set(name, o);
+    }
+
+    const buyBoxDisc = r.price != null && r.mrp && r.mrp > 0
+      ? ((r.mrp - r.price) / r.mrp) * 100
+      : null;
+
+    const row: (string | number)[] = [
+      r.asin,
+      r.title,
+      r.category,
+      r.url,
+      r.price ?? '',
+      r.mrp ?? '',
+      buyBoxDisc != null ? buyBoxDisc.toFixed(1) : '',
+      r.totalSellers,
+      r.lastSnapshotAt ?? '',
+    ];
+
+    for (const s of sellers) {
+      const o = offerBySeller.get(s);
+      const sellerPrice = o?.price ?? null;
+      const discMrp = sellerPrice != null && r.mrp && r.mrp > 0
+        ? ((r.mrp - sellerPrice) / r.mrp) * 100
+        : null;
+      const discBb = sellerPrice != null && r.price != null && r.price > 0
+        ? ((r.price - sellerPrice) / r.price) * 100
+        : null;
+      row.push(
+        sellerPrice ?? '',
+        discMrp != null ? discMrp.toFixed(1) : '',
+        discBb != null ? discBb.toFixed(1) : '',
+      );
+    }
+
+    lines.push(row.map(csvEscape).join(','));
+  }
+  return lines.join('\r\n');
+}
+
+function downloadCsv(filename: string, csv: string) {
+  // Prepend UTF-8 BOM so Excel renders ₹ and other glyphs correctly.
+  const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
 export default function PwTable() {
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
@@ -131,28 +296,25 @@ export default function PwTable() {
           const payload = p.last_snapshot?.payload_json ?? {};
           const title: string = payload.title || p.title_known || p.asin_or_sku;
           const price = payload.price != null ? Number(payload.price) : null;
-          const rating = payload.rating != null ? Number(payload.rating) : null;
-          const reviews = payload.reviewCount != null ? Number(payload.reviewCount) : null;
-          const bsr = typeof payload.bsr === 'string' && payload.bsr ? payload.bsr : null;
-          const inStock =
-            typeof payload.inStock === 'boolean' ? payload.inStock
-            : typeof payload.in_stock === 'boolean' ? payload.in_stock
-            : null;
+          const mrp = payload.mrp != null ? Number(payload.mrp) : null;
+          const offers = (p.seller_offers ?? []).filter((o): o is SellerOffer => !!o);
           return {
             id: p.id,
             asin: p.asin_or_sku,
             url: p.url,
             title,
             price,
-            rating,
-            reviews,
-            bsr,
-            in_stock: inStock,
-            last_seen_at: p.last_seen_at,
+            mrp,
+            cocoblu: pickSeller(offers, SELLER_PATTERNS.cocoblu),
+            repo: pickSeller(offers, SELLER_PATTERNS.repo),
+            pw: pickSeller(offers, SELLER_PATTERNS.pw),
+            totalSellers: offers.length,
             category: categorize(title),
-            is_own: true,
+            lastSnapshotAt: p.last_snapshot?.fetched_at ?? null,
+            offers,
           };
-        });
+        })
+        .filter((r) => !EXCLUDED_CATEGORIES.has(r.category));
       setRows(built);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load');
@@ -184,7 +346,6 @@ export default function PwTable() {
       arr.push(r);
       map.set(r.category, arr);
     }
-    // Sort categories using the canonical order, then unknowns alphabetically.
     return [...map.entries()].sort((a, b) => {
       const ai = CATEGORY_ORDER.indexOf(a[0]);
       const bi = CATEGORY_ORDER.indexOf(b[0]);
@@ -204,40 +365,37 @@ export default function PwTable() {
   }, [rows]);
 
   const stats = useMemo(() => {
-    const prices = rows.map((r) => r.price).filter((v): v is number => v != null);
-    const ratings = rows.map((r) => r.rating).filter((v): v is number => v != null);
-    return {
-      total: rows.length,
-      categories: categoryCounts.size,
-      avgPrice: prices.length ? prices.reduce((a, b) => a + b, 0) / prices.length : null,
-      avgRating: ratings.length ? ratings.reduce((a, b) => a + b, 0) / ratings.length : null,
-    };
-  }, [rows, categoryCounts]);
+    let withCoco = 0, withRepo = 0, withPw = 0, withMrp = 0;
+    for (const r of rows) {
+      if (r.cocoblu.price != null) withCoco++;
+      if (r.repo.price != null) withRepo++;
+      if (r.pw.price != null) withPw++;
+      if (r.mrp != null) withMrp++;
+    }
+    return { total: rows.length, withCoco, withRepo, withPw, withMrp };
+  }, [rows]);
 
   return (
     <div className="space-y-12">
       <section className="flex items-end justify-between gap-10 flex-wrap">
         <div className="max-w-2xl space-y-4">
-          <div className="kicker">PW Catalogue · Categorized View</div>
+          <div className="kicker">PW Catalogue · Seller Comparison</div>
           <h1 className="serif text-[68px] leading-[0.95] tracking-tight" style={{ color: 'var(--ink)' }}>
             PW Table
           </h1>
           <p className="text-[16px] leading-relaxed" style={{ color: 'var(--muted)' }}>
-            Every PW-owned listing, sorted into product families. A clean tabular slice of the
-            catalogue — built for sweeping reviews and quick category-level drills.
+            Every PW-owned listing — sliced into product families, price-mapped against MRP, and
+            cross-checked with the three known sellers (Coco Blue · Repro · PW). Stationery and
+            uncategorised items are intentionally excluded.
           </p>
         </div>
 
         <div className="metric-strip">
           <div><div className="kicker">PW SKUs</div><div className="metric-val">{stats.total}</div></div>
-          <div><div className="kicker">Categories</div><div className="metric-val">{stats.categories}</div></div>
-          <div><div className="kicker">Avg Price</div><div className="metric-val">{formatINR(stats.avgPrice)}</div></div>
-          <div>
-            <div className="kicker">Avg Rating</div>
-            <div className="metric-val">
-              {stats.avgRating != null ? `★ ${stats.avgRating.toFixed(2)}` : '—'}
-            </div>
-          </div>
+          <div><div className="kicker">w/ MRP</div><div className="metric-val">{stats.withMrp}</div></div>
+          <div><div className="kicker">Coco Blue</div><div className="metric-val">{stats.withCoco}</div></div>
+          <div><div className="kicker">Repro</div><div className="metric-val">{stats.withRepo}</div></div>
+          <div><div className="kicker">PW</div><div className="metric-val">{stats.withPw}</div></div>
         </div>
       </section>
 
@@ -261,7 +419,25 @@ export default function PwTable() {
           ))}
         </div>
 
-        <div className="flex justify-end pt-2">
+        <div className="flex justify-end items-center gap-3 pt-2 flex-wrap">
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              const dataset = filtered.length ? filtered : rows;
+              if (!dataset.length) return;
+              const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+              const scope =
+                activeCategory === 'all'
+                  ? (search.trim() ? 'search' : 'all')
+                  : activeCategory.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+              downloadCsv(`pw-table_${scope}_${stamp}.csv`, buildPwCsv(dataset));
+            }}
+            disabled={loading || !rows.length}
+            title="Download the visible PW table with one column per seller (price + discount %)"
+          >
+            Export CSV ({(filtered.length || rows.length).toLocaleString('en-IN')})
+          </button>
           <div className="search-wrap">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden>
               <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.4" />
@@ -286,7 +462,7 @@ export default function PwTable() {
         <div className="panel p-10 text-center space-y-2">
           <div className="kicker">Empty</div>
           <p className="serif text-[28px]" style={{ color: 'var(--ink)' }}>No PW SKUs match.</p>
-          <p style={{ color: 'var(--muted)' }}>Adjust filters or seed the catalogue.</p>
+          <p style={{ color: 'var(--muted)' }}>Adjust filters or run the seller scrape.</p>
         </div>
       )}
 
@@ -294,8 +470,11 @@ export default function PwTable() {
         const page = pageByCat[category] ?? 1;
         const visibleCount = Math.min(list.length, page * PAGE_SIZE);
         const visible = list.slice(0, visibleCount);
-        const prices = list.map((r) => r.price).filter((v): v is number => v != null);
-        const avgPrice = prices.length ? prices.reduce((a, b) => a + b, 0) / prices.length : null;
+        const pwPrices = list.map((r) => r.pw.price).filter((v): v is number => v != null);
+        const avgPw = pwPrices.length ? pwPrices.reduce((a, b) => a + b, 0) / pwPrices.length : null;
+        const sellersWithData = list.filter(
+          (r) => r.cocoblu.price != null || r.repo.price != null || r.pw.price != null,
+        ).length;
         return (
           <section key={category} className="space-y-5">
             <div className="flex items-end justify-between flex-wrap gap-4">
@@ -307,40 +486,32 @@ export default function PwTable() {
               </div>
               <div className="flex items-center gap-5 text-[12.5px]" style={{ color: 'var(--muted)' }}>
                 <span>
-                  <span className="kicker mr-1.5">avg</span>
-                  <span className="mono" style={{ color: 'var(--ink)' }}>{formatINR(avgPrice)}</span>
+                  <span className="kicker mr-1.5">avg PW</span>
+                  <span className="mono" style={{ color: 'var(--ink)' }}>{formatINR(avgPw)}</span>
                 </span>
                 <span>
-                  <span className="kicker mr-1.5">priced</span>
-                  <span className="mono" style={{ color: 'var(--ink)' }}>{prices.length}/{list.length}</span>
+                  <span className="kicker mr-1.5">w/ sellers</span>
+                  <span className="mono" style={{ color: 'var(--ink)' }}>{sellersWithData}/{list.length}</span>
                 </span>
               </div>
             </div>
 
             <div className="pw-table">
-              <div className="pw-table__head">
+              <div className="pw-table__head pw-table__head--sellers">
                 <div className="col-head">ASIN</div>
                 <div className="col-head">Title</div>
-                <div className="col-head" style={{ textAlign: 'right' }}>Price</div>
-                <div className="col-head" style={{ textAlign: 'right' }}>Rating</div>
-                <div className="col-head" style={{ textAlign: 'right' }}>Reviews</div>
-                <div className="col-head">BSR</div>
-                <div className="col-head">Stock</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>MRP</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>Coco Blue</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>Repro</div>
+                <div className="col-head" style={{ textAlign: 'right' }}>PW</div>
                 <div className="col-head">Last Seen</div>
                 <div className="col-head" style={{ textAlign: 'right' }}>Open</div>
               </div>
 
               {visible.map((r) => {
-                const stockClass =
-                  r.in_stock === false ? 'chip chip-red'
-                  : r.in_stock === true ? 'chip chip-green'
-                  : 'chip';
-                const stockLabel =
-                  r.in_stock === false ? 'Out'
-                  : r.in_stock === true ? 'In'
-                  : '—';
+                const pwRef = r.pw.price ?? r.price;
                 return (
-                  <div key={r.id} className="pw-table__row">
+                  <div key={r.id} className="pw-table__row pw-table__row--sellers">
                     <div className="sku-table__cell-mono" title={r.asin}>{r.asin}</div>
                     <div className="pw-table__title">
                       <a
@@ -352,28 +523,19 @@ export default function PwTable() {
                       >
                         {r.title}
                       </a>
+                      <div className="pw-table__title-meta">
+                        {r.totalSellers > 0
+                          ? <span>{r.totalSellers} seller{r.totalSellers === 1 ? '' : 's'}</span>
+                          : <span style={{ color: 'var(--faint)' }}>no offers</span>}
+                      </div>
                     </div>
-                    <div className="sku-table__cell-num">{formatINR(r.price)}</div>
-                    <div className="sku-table__cell-num">
-                      {r.rating != null ? `★ ${r.rating.toFixed(1)}` : '—'}
-                    </div>
-                    <div className="sku-table__cell-num">
-                      {r.reviews != null ? r.reviews.toLocaleString('en-IN') : '—'}
-                    </div>
-                    <div className="sku-table__cell-mono" title={r.bsr ?? undefined}>
-                      {r.bsr ? r.bsr.replace(/^#?\s*/, '#') : '—'}
-                    </div>
-                    <div>
-                      <span className={stockClass}>{stockLabel}</span>
-                    </div>
-                    <div className="sku-table__cell-text">{timeAgo(r.last_seen_at)}</div>
+                    <div className="sku-table__cell-num">{formatINR(r.mrp)}</div>
+                    <SellerColumn cell={r.cocoblu} mrp={r.mrp} pwRef={pwRef} isAnchor={false} />
+                    <SellerColumn cell={r.repo} mrp={r.mrp} pwRef={pwRef} isAnchor={false} />
+                    <SellerColumn cell={r.pw} mrp={r.mrp} pwRef={pwRef} isAnchor={true} />
+                    <div className="sku-table__cell-text">{timeAgo(r.lastSnapshotAt)}</div>
                     <div className="pw-table__open">
-                      <a
-                        href={r.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="link-quiet text-[12px]"
-                      >↗</a>
+                      <a href={r.url} target="_blank" rel="noreferrer" className="link-quiet text-[12px]">↗</a>
                     </div>
                   </div>
                 );
@@ -420,6 +582,43 @@ export default function PwTable() {
           </section>
         );
       })}
+    </div>
+  );
+}
+
+// ─── Seller cell ─────────────────────────────────────────────────────────────
+function SellerColumn({
+  cell,
+  mrp,
+  pwRef,
+  isAnchor,
+}: {
+  cell: SellerCell;
+  mrp: number | null;
+  pwRef: number | null;
+  isAnchor: boolean;
+}) {
+  if (cell.price == null) {
+    return (
+      <div className="pw-seller pw-seller--missing">
+        <span className="pw-seller__na">N/A</span>
+      </div>
+    );
+  }
+  const off = formatPctOff(cell.price, mrp);
+  const delta = isAnchor ? null : formatDelta(cell.price, pwRef);
+  return (
+    <div className="pw-seller" title={cell.rawName ?? undefined}>
+      <div className="pw-seller__price">{formatINR(cell.price)}</div>
+      <div className="pw-seller__meta">
+        {off && <span className="pw-seller__off">{off}</span>}
+        {delta && (
+          <span className={`pw-seller__delta pw-seller__delta--${delta.tone}`}>
+            {delta.label}
+          </span>
+        )}
+        {!off && !delta && <span className="pw-seller__hint">—</span>}
+      </div>
     </div>
   );
 }
