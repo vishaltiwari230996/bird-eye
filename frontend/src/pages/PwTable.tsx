@@ -375,6 +375,18 @@ export default function PwTable() {
     return { total: rows.length, withCoco, withRepo, withPw, withMrp };
   }, [rows]);
 
+  const exportCsv = () => {
+    const dataset = filtered.length ? filtered : rows;
+    if (!dataset.length) return;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const scope =
+      activeCategory === 'all'
+        ? (search.trim() ? 'search' : 'all')
+        : activeCategory.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    downloadCsv(`pw-table_${scope}_${stamp}.csv`, buildPwCsv(dataset));
+  };
+  const exportCount = filtered.length || rows.length;
+
   return (
     <div className="space-y-12">
       <section className="flex items-end justify-between gap-10 flex-wrap">
@@ -388,6 +400,24 @@ export default function PwTable() {
             cross-checked with the three known sellers (Coco Blue · Repro · PW). Stationery and
             uncategorised items are intentionally excluded.
           </p>
+          <div className="flex items-center gap-3 flex-wrap pt-2">
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={exportCsv}
+              disabled={loading || !rows.length}
+              title="Download the visible PW table — one column per seller (price, discount % off MRP, discount vs Buy Box)"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden>
+                <path d="M8 1.5v8.5m0 0L4.5 6.5M8 10l3.5-3.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M2 11.5v2A1.5 1.5 0 0 0 3.5 15h9a1.5 1.5 0 0 0 1.5-1.5v-2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+              </svg>
+              Export CSV ({exportCount.toLocaleString('en-IN')})
+            </button>
+            <span className="text-[12px]" style={{ color: 'var(--faint)' }}>
+              One row per SKU · per-seller columns: price, discount % off MRP, discount vs Buy Box
+            </span>
+          </div>
         </div>
 
         <div className="metric-strip">
@@ -422,21 +452,12 @@ export default function PwTable() {
         <div className="flex justify-end items-center gap-3 pt-2 flex-wrap">
           <button
             type="button"
-            className="btn btn-primary"
-            onClick={() => {
-              const dataset = filtered.length ? filtered : rows;
-              if (!dataset.length) return;
-              const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-              const scope =
-                activeCategory === 'all'
-                  ? (search.trim() ? 'search' : 'all')
-                  : activeCategory.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-              downloadCsv(`pw-table_${scope}_${stamp}.csv`, buildPwCsv(dataset));
-            }}
+            className="btn btn-ghost"
+            onClick={exportCsv}
             disabled={loading || !rows.length}
-            title="Download the visible PW table with one column per seller (price + discount %)"
+            title="Download the visible PW table"
           >
-            Export CSV ({(filtered.length || rows.length).toLocaleString('en-IN')})
+            Export CSV ({exportCount.toLocaleString('en-IN')})
           </button>
           <div className="search-wrap">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden>
