@@ -49,6 +49,7 @@ interface Card {
   asin_or_sku: string;
   url: string;
   title: string;
+  hasTitle: boolean;
   description: string | null;
   price: number | null;
   rating: number | null;
@@ -155,7 +156,11 @@ export default function Products() {
     }
     return products.map((p) => {
       const payload = p.last_snapshot?.payload_json ?? {};
-      const title = payload.title || p.title_known || p.asin_or_sku;
+      const realTitle: string | null =
+        (typeof payload.title === 'string' && payload.title.trim()) ? payload.title.trim()
+        : (typeof p.title_known === 'string' && p.title_known.trim()) ? p.title_known.trim()
+        : null;
+      const title = realTitle ?? p.asin_or_sku;
       const price = payload.price != null ? Number(payload.price) : null;
       const rating = payload.rating != null ? Number(payload.rating) : null;
       const reviews = payload.reviewCount != null ? Number(payload.reviewCount) : null;
@@ -175,6 +180,7 @@ export default function Products() {
         asin_or_sku: p.asin_or_sku,
         url: p.url,
         title,
+        hasTitle: realTitle != null,
         description,
         price,
         rating,
@@ -538,13 +544,29 @@ function ProductRow({
         </div>
 
         <div className="sku-table__title">
-          <div className="sku-table__title-text" title={card.title}>{card.title}</div>
-          <div className="sku-table__sub">
-            <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{card.asin_or_sku}</span>
-            {card.pools[0] && (
-              <span className="text-[11px]" style={{ color: 'var(--faint)' }}>· {card.pools[0]}</span>
-            )}
-          </div>
+          {card.hasTitle ? (
+            <>
+              <div className="sku-table__title-text" title={card.title}>{card.title}</div>
+              <div className="sku-table__sub">
+                <span className="mono text-[11px]" style={{ color: 'var(--faint)' }}>{card.asin_or_sku}</span>
+                {card.pools[0] && (
+                  <span className="text-[11px]" style={{ color: 'var(--faint)' }}>· {card.pools[0]}</span>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="sku-table__title-text mono" title={card.asin_or_sku} style={{ fontSize: 13, letterSpacing: '0.02em' }}>
+                {card.asin_or_sku}
+              </div>
+              <div className="sku-table__sub">
+                <span className="text-[11px]" style={{ color: 'var(--faint)', fontStyle: 'italic' }}>Awaiting first scrape</span>
+                {card.pools[0] && (
+                  <span className="text-[11px]" style={{ color: 'var(--faint)' }}>· {card.pools[0]}</span>
+                )}
+              </div>
+            </>
+          )}
         </div>
 
         <div>

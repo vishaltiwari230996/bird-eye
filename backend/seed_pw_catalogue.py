@@ -1,18 +1,21 @@
 """seed_pw_catalogue.py
 
-Bulk-import the full PW Amazon catalogue from `Use_Eye_Tools.xlsx` into the
+Bulk-import the full PW Amazon catalogue from the master workbook into the
 `products` table.
 
 - Each row in the workbook (after the header) is treated as one PW-owned SKU.
-- Columns expected: asin1 | item-name | URL.
+- Columns expected (current workbook): ISBN No | ASIN No | Title | Flag | Product URL | 2nd Type.
 - A pool named "PW Catalogue" is created (or reused) and every imported SKU is
   assigned to it with `is_own = TRUE`.
 - Existing rows (matched by `(platform, asin_or_sku)`) are NOT duplicated; their
   `title_known`, `url`, `is_own` and `pool_id` are refreshed instead.
+- Pass `--reset` to first purge the current PW Catalogue (and its cascade of
+  seller_offers / snapshots / changes) before re-importing.
 
 Usage:
-    python backend/seed_pw_catalogue.py            # commit the import
-    python backend/seed_pw_catalogue.py --dry-run  # report what would change
+    python backend/seed_pw_catalogue.py                      # commit the import
+    python backend/seed_pw_catalogue.py --reset              # wipe pool + reimport
+    python backend/seed_pw_catalogue.py --dry-run            # report what would change
 
 Run from the repo root or from `backend/`.
 """
@@ -37,9 +40,16 @@ from psycopg2.extras import execute_values  # noqa: E402
 
 from database import get_pool, query, query_one  # noqa: E402
 
-DEFAULT_XLSX = Path(r"D:/birdeye/Use_Eye_Tools.xlsx")
+DEFAULT_XLSX = Path(r"D:/birdeye/Bird_Eyes_06052026.xlsx")
 POOL_NAME = "PW Catalogue"
 PLATFORM = "amazon"
+
+# Column indices in the current Bird_Eyes workbook.
+# 0: ISBN No, 1: ASIN No, 2: Title, 3: Flag, 4: Product URL, 5: 2nd Type
+COL_ASIN = 1
+COL_TITLE = 2
+COL_URL = 4
+COL_ISBN = 0
 
 
 def normalise_asin(value: object) -> str | None:
@@ -79,18 +89,52 @@ def read_rows(xlsx_path: Path) -> list[tuple[str, str, str | None]]:
         if i == 0:
             # Header row.
             continue
-        if not row or len(row) < 1:
+        if not row:
             continue
-        asin = normalise_asin(row[0])
+        asin = normalise_asin(row[COL_ASIN] if len(row) > COL_ASIN else None)
+        if not asin:
+            # Fallback to ISBN column if ASIN cell is empty.
+            asin = normalise_asin(row[COL_ISBN] if len(row) > COL_ISBN else None)
         if not asin:
             continue
         if asin in seen:
             continue
         seen.add(asin)
-        title = normalise_title(row[1] if len(row) > 1 else None)
-        url = normalise_url(row[2] if len(row) > 2 else None, asin)
+        title = normalise_title(row[COL_TITLE] if len(row) > COL_TITLE else None)
+        url = normalise_url(row[COL_URL] if len(row) > COL_URL else None, asin)
         rows.append((asin, url, title))
     return rows
+
+
+def purge_pool(pool_id: int) -> dict:
+    """Delete every product attached to the PW Catalogue pool plus dependent rows.
+
+    Order matters because seller_offers / snapshots / changes hold FKs onto products.
+    """
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM products WHERE pool_id = %s", (pool_id,))
+            ids = [r["id"] for r in cur.fetchall()]
+            if not ids:
+                conn.commit()
+                return {"products": 0, "seller_offers": 0, "snapshots": 0, "changes": 0}
+            cur.execute("DELETE FROM seller_offers WHERE product_id = ANY(%s)", (ids,))
+            so = cur.rowcount
+            cur.execute("DELETE FROM snapshots WHERE product_id = ANY(%s)", (ids,))
+            sn = cur.rowcount
+            cur.execute("DELETE FROM changes WHERE product_id = ANY(%s)", (ids,))
+            ch = cur.rowcount
+            cur.execute("DELETE FROM products WHERE id = ANY(%s)", (ids,))
+            pr = cur.rowcount
+        conn.commit()
+        return {"products": pr, "seller_offers": so, "snapshots": sn, "changes": ch}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
 
 
 def ensure_pool() -> int:
@@ -145,9 +189,10 @@ def upsert(rows: list[tuple[str, str, str | None]], pool_id: int) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Seed PW Amazon catalogue from Use_Eye_Tools.xlsx")
+    parser = argparse.ArgumentParser(description="Seed PW Amazon catalogue from the master workbook")
     parser.add_argument("--xlsx", type=Path, default=DEFAULT_XLSX)
     parser.add_argument("--dry-run", action="store_true", help="Report counts without touching the DB")
+    parser.add_argument("--reset", action="store_true", help="Purge existing PW Catalogue (and dependent rows) before reseeding")
     args = parser.parse_args()
 
     if not args.xlsx.exists():
@@ -175,6 +220,13 @@ def main() -> int:
 
     pool_id = ensure_pool()
     print(f"Pool '{POOL_NAME}' id = {pool_id}")
+    if args.reset:
+        purged = purge_pool(pool_id)
+        print(
+            f"Purged existing catalogue: products={purged['products']} "
+            f"seller_offers={purged['seller_offers']} snapshots={purged['snapshots']} "
+            f"changes={purged['changes']}"
+        )
     stats = upsert(rows, pool_id)
     print(
         f"Done. inserted={stats['inserted']}  updated={stats['updated']}  unchanged={stats['unchanged']}"

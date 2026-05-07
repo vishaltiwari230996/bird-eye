@@ -679,13 +679,15 @@ body {
     border: 1px solid var(--line);
     border-radius: 14px;
     background: rgba(255, 252, 244, 0.50);
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: visible;
+    -webkit-overflow-scrolling: touch;
   }
   .sku-table__head {
     display: grid;
     grid-template-columns:
       48px              /* expand caret */
-      minmax(0, 2.4fr)  /* title + asin */
+      minmax(280px, 2.4fr)  /* title + asin */
       130px             /* brand / own */
       110px             /* platform */
       120px             /* price */
@@ -701,12 +703,13 @@ body {
     background: rgba(28, 24, 18, 0.04);
     border-bottom: 1px solid var(--line);
     align-items: center;
+    min-width: 1640px;
   }
   .sku-table__row {
     display: grid;
     grid-template-columns:
       48px
-      minmax(0, 2.4fr)
+      minmax(280px, 2.4fr)
       130px
       110px
       120px
@@ -725,6 +728,7 @@ body {
     transition: background 160ms ease;
     text-align: left;
     width: 100%;
+    min-width: 1640px;
     border-left: 0;
     border-right: 0;
     border-top: 0;
@@ -852,21 +856,11 @@ body {
     align-items: center;
     gap: 6px;
   }
-  @media (max-width: 1280px) {
-    .sku-table__head, .sku-table__row {
-      grid-template-columns:
-        40px
-        minmax(0, 2.2fr)
-        110px
-        110px
-        100px
-        80px
-        130px
-        110px
-        110px;
-      gap: 10px;
-    }
-    .sku-table__hide-md { display: none !important; }
+  /* Pager + expand panel must stretch the full scroll width so they line up
+     with the rows when the table is wider than the viewport. */
+  .sku-table__pager,
+  .sku-table__expand {
+    min-width: 1640px;
   }
 
   /* ── PW Table (categorized PW-only listings) ─────────────────────── */
@@ -933,7 +927,75 @@ body {
     transition: color 160ms ease;
   }
   .pw-table__title-text:hover { color: var(--accent-blue); }
+  .pw-table__title-meta {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin-top: 4px;
+  }
   .pw-table__open { text-align: right; }
+
+  /* ── Seller-comparison variant (8 columns) ───────────────────────── */
+  .pw-table__head--sellers,
+  .pw-table__row--sellers {
+    grid-template-columns:
+      130px              /* asin */
+      minmax(0, 2.2fr)   /* title */
+      96px               /* mrp */
+      130px              /* coco blue */
+      130px              /* repo */
+      130px              /* pw */
+      110px              /* last seen */
+      52px;              /* open */
+  }
+  .pw-seller {
+    text-align: right;
+    font-feature-settings: 'tnum' 1, 'lnum' 1;
+    line-height: 1.15;
+  }
+  .pw-seller__price {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 13.5px;
+    color: var(--ink);
+    font-weight: 500;
+    letter-spacing: 0.01em;
+  }
+  .pw-seller__meta {
+    margin-top: 4px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.02em;
+  }
+  .pw-seller__off {
+    color: var(--accent-green, #2f7a4d);
+    font-weight: 500;
+  }
+  .pw-seller__delta {
+    color: var(--muted);
+  }
+  .pw-seller__delta--down { color: var(--accent-green, #2f7a4d); }
+  .pw-seller__delta--up   { color: var(--accent-red, #b54545); }
+  .pw-seller__delta--flat { color: var(--faint); }
+  .pw-seller__hint        { color: var(--faint); }
+  .pw-seller--missing {
+    text-align: right;
+    color: var(--faint);
+  }
+  .pw-seller__na {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border: 1px dashed var(--line);
+    border-radius: 6px;
+    color: var(--faint);
+  }
 
   /* Timeline */
   .timeline {
