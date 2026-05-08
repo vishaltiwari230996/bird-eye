@@ -23,7 +23,7 @@ from pydantic import BaseModel
 load_dotenv()
 
 from database import query, query_one, transaction
-from scraper import scrape_offer_listings, scrape_product
+from scraper import scrape_offer_listings, scrape_product, scrape_via_brightdata
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -752,31 +752,117 @@ async def cron_monitor(request: Request):
     if cron_secret and auth != cron_secret:
         raise HTTPException(401, "Unauthorized")
     products = query("SELECT id, platform, asin_or_sku, url FROM products ORDER BY id")
-    results = []
-    for product in products:
+    product_by_id = {p["id"]: p for p in products}
+
+    def _save_payload(pid: int, payload: dict) -> dict:
+        """Persist a snapshot and detect changes. Returns a result dict."""
+        h = hash_payload(payload)
+        last_snap = query_one(
+            "SELECT hash, payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1",
+            [pid],
+        )
+        query(
+            "INSERT INTO snapshots (product_id, payload_json, hash, fetched_at) VALUES ($1,$2::jsonb,$3,NOW())",
+            [pid, json.dumps(payload), h],
+        )
+        query("UPDATE products SET last_seen_at=NOW() WHERE id=$1", [pid])
+        change_count = 0
+        if last_snap and last_snap["hash"] != h:
+            prev = last_snap["payload_json"]
+            if isinstance(prev, str):
+                prev = json.loads(prev)
+            for fc in diff_payloads(prev, payload):
+                query(
+                    "INSERT INTO changes (product_id, field, old_value, new_value, detected_at) VALUES ($1,$2,$3,$4,NOW())",
+                    [pid, fc["field"], fc["old_value"], fc["new_value"]],
+                )
+                change_count += 1
+        return {"productId": pid, "status": "success", "changes": change_count}
+
+    async def _playwright_scrape_and_save(product: dict) -> dict:
+        """Fallback: scrape one product with Playwright and save."""
         pid = product["id"]
         try:
             payload = await scrape_product(product["asin_or_sku"], product["url"])
             if not payload:
-                results.append({"productId": pid, "status": "blocked"})
-                continue
-            h = hash_payload(payload)
-            last_snap = query_one("SELECT hash, payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1", [pid])
-            query("INSERT INTO snapshots (product_id, payload_json, hash, fetched_at) VALUES ($1,$2::jsonb,$3,NOW())", [pid, json.dumps(payload), h])
-            query("UPDATE products SET last_seen_at=NOW() WHERE id=$1", [pid])
-            change_count = 0
-            if last_snap and last_snap["hash"] != h:
-                prev = last_snap["payload_json"]
-                if isinstance(prev, str):
-                    prev = json.loads(prev)
-                for fc in diff_payloads(prev, payload):
-                    query("INSERT INTO changes (product_id, field, old_value, new_value, detected_at) VALUES ($1,$2,$3,$4,NOW())", [pid, fc["field"], fc["old_value"], fc["new_value"]])
-                    change_count += 1
-            results.append({"productId": pid, "status": "success", "changes": change_count})
+                return {"productId": pid, "status": "blocked"}
+            return _save_payload(pid, payload)
         except Exception as e:
-            results.append({"productId": pid, "status": "error", "error": str(e)})
+            return {"productId": pid, "status": "error", "error": str(e)}
+
+    results: list[dict] = []
+
+    # ── Pass 1: BrightData batch (fast, structured, no IP blocks) ─────────
+    bd_results = await scrape_via_brightdata(list(products))
+    bd_succeeded: set[int] = set()
+
+    for pid, payload in bd_results.items():
+        if payload:
+            try:
+                r = _save_payload(pid, payload)
+                r["source"] = "brightdata"
+                results.append(r)
+                bd_succeeded.add(pid)
+            except Exception as e:
+                results.append({"productId": pid, "status": "error", "error": str(e), "source": "brightdata"})
+        else:
+            results.append({"productId": pid, "status": "blocked", "source": "brightdata"})
+
+    # Products BrightData didn't return at all (not even an error item)
+    bd_missing = [p for p in products if p["id"] not in bd_results]
+
+    # ── Pass 2: Playwright fallback for missed/failed SKUs ────────────────
+    playwright_needed = [
+        p for p in products
+        if p["id"] not in bd_succeeded
+    ] if not bd_missing and bd_results else bd_missing or list(products)
+
+    # If BrightData returned nothing at all (unconfigured), scrape everything
+    if not bd_results:
+        playwright_needed = list(products)
+        results = []  # will be populated below
+
+    for product in playwright_needed:
+        result = await _playwright_scrape_and_save(product)
+        result["source"] = "playwright"
+        # Replace any existing bd entry for this product
+        results = [r for r in results if r["productId"] != product["id"]]
+        results.append(result)
         await asyncio.sleep(0.5)
-    return {"processed": len(results), "results": results}
+
+    # ── Pass 3: Retry only the SKUs still blocked/errored ─────────────────
+    MAX_RETRY_ATTEMPTS = 2
+    retry_results: list[dict] = []
+    failed = [r for r in results if r["status"] in ("blocked", "error")]
+
+    for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+        if not failed:
+            break
+        await asyncio.sleep(30 * attempt)
+        still_failed = []
+        for r in failed:
+            pid = r["productId"]
+            product = product_by_id.get(pid)
+            if not product:
+                continue
+            retry_r = await _playwright_scrape_and_save(product)
+            retry_r["attempt"] = attempt
+            retry_r["source"] = "playwright-retry"
+            retry_results.append(retry_r)
+            if retry_r["status"] in ("blocked", "error"):
+                still_failed.append(retry_r)
+            await asyncio.sleep(0.5)
+        failed = still_failed
+
+    return {
+        "processed": len(results),
+        "brightdata_hits": len(bd_succeeded),
+        "results": results,
+        "retry_attempts": MAX_RETRY_ATTEMPTS,
+        "retried": len(retry_results),
+        "retry_results": retry_results,
+        "still_failed": [r["productId"] for r in failed],
+    }
 
 
 # ─── Executive Report ─────────────────────────────────────────────────────────

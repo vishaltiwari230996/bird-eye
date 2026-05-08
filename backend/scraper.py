@@ -1565,6 +1565,135 @@ def parse_product_page(html: str) -> Optional[dict]:
     }
 
 
+# ─── BrightData managed scraper ──────────────────────────────────────────────
+
+def _map_brightdata_results(
+    results: list[dict], url_to_pid: dict[str, int]
+) -> dict[int, Optional[dict]]:
+    """Map BrightData API result items to our internal payload format."""
+    out: dict[int, Optional[dict]] = {}
+    for item in results:
+        url = item.get("url") or (item.get("input") or {}).get("url", "")
+        pid = url_to_pid.get(url)
+        if pid is None:
+            continue
+        if item.get("error") or item.get("type") == "error":
+            out[pid] = None
+            continue
+
+        def _to_float(raw) -> Optional[float]:
+            try:
+                return float(str(raw).replace(",", "").replace("₹", "").strip()) if raw else None
+            except (ValueError, TypeError):
+                return None
+
+        price = _to_float(item.get("price") or item.get("final_price") or item.get("selling_price"))
+        mrp = _to_float(item.get("original_price") or item.get("mrp") or item.get("list_price"))
+
+        bsr_raw = item.get("best_sellers_rank") or item.get("best_seller_rank") or item.get("bsr")
+        bsr: Optional[str] = None
+        if isinstance(bsr_raw, list) and bsr_raw:
+            first = bsr_raw[0]
+            bsr = f"#{first.get('rank', '')} in {first.get('category', '')}"
+        elif isinstance(bsr_raw, (str, int)):
+            bsr = str(bsr_raw)
+
+        images = item.get("images") or []
+        bullets = item.get("feature_bullets") or item.get("bullets") or item.get("bullet_points") or []
+
+        out[pid] = {
+            "title": item.get("title") or item.get("name"),
+            "price": price,
+            "mrp": mrp,
+            "currency": item.get("currency", "INR"),
+            "rating": item.get("rating") or item.get("stars"),
+            "reviewCount": item.get("reviews_count") or item.get("rating_count") or item.get("review_count"),
+            "bsr": bsr,
+            "availability": item.get("availability"),
+            "description": item.get("description"),
+            "image": images[0] if images else None,
+            "seo": {
+                "bulletCount": len(bullets) if isinstance(bullets, list) else 0,
+                "imageCount": len(images),
+                "hasAPlus": bool(item.get("a_plus_content") or item.get("aplus")),
+            },
+            "offers": {
+                "availability": item.get("availability"),
+                "seller": item.get("seller_name") or item.get("brand"),
+            },
+        }
+    return out
+
+
+async def scrape_via_brightdata(products: list[dict]) -> dict[int, Optional[dict]]:
+    """Fetch Amazon product data via BrightData's managed Amazon scraper API.
+
+    products: list of {"id": int, "url": str}
+    Returns: dict mapping product_id → payload dict (None if BrightData failed
+             for that product). Returns empty dict if credentials are missing.
+    """
+    token = os.environ.get("BRIGHTDATA_TOKEN", "").strip()
+    dataset_id = os.environ.get("BRIGHTDATA_DATASET_ID", "").strip()
+    if not token or not dataset_id:
+        return {}
+
+    url_to_pid: dict[str, int] = {p["url"]: p["id"] for p in products}
+    input_items = [{"url": p["url"], "zipcode": "", "language": ""} for p in products]
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"https://api.brightdata.com/datasets/v3/scrape"
+                f"?dataset_id={dataset_id}&notify=false&include_errors=true",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={"input": input_items},
+            )
+            r.raise_for_status()
+            resp = r.json()
+    except Exception as e:
+        print(f"[brightdata] Trigger error: {e}")
+        return {}
+
+    # Synchronous response: data returned directly as a list
+    if isinstance(resp, list):
+        return _map_brightdata_results(resp, url_to_pid)
+
+    # Asynchronous response: poll for snapshot
+    snapshot_id = resp.get("snapshot_id") if isinstance(resp, dict) else None
+    if not snapshot_id:
+        print(f"[brightdata] Unexpected trigger response: {str(resp)[:200]}")
+        return {}
+
+    print(f"[brightdata] Polling snapshot {snapshot_id} for {len(products)} products…")
+    for attempt in range(36):  # max ~6 minutes (36 × 10 s)
+        await asyncio.sleep(10)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    print(f"[brightdata] Snapshot ready — {len(data)} records (attempt {attempt + 1})")
+                    return _map_brightdata_results(data, url_to_pid)
+            elif r.status_code == 202:
+                continue  # still processing
+            else:
+                print(f"[brightdata] Poll error {r.status_code}: {r.text[:200]}")
+                break
+        except Exception as e:
+            print(f"[brightdata] Poll exception: {e}")
+            break
+
+    print(f"[brightdata] Timed out waiting for snapshot {snapshot_id}")
+    return {}
+
+
 # ─── Product scrape ───────────────────────────────────────────────────────────
 
 async def scrape_product(asin: str, url: str) -> Optional[dict]:
