@@ -23,7 +23,7 @@ from pydantic import BaseModel
 load_dotenv()
 
 from database import query, query_one, transaction
-from scraper import scrape_offer_listings, scrape_product, scrape_via_brightdata
+from scraper import scrape_offer_listings, scrape_product, scrape_sellers_via_brightdata, scrape_via_brightdata
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -265,35 +265,71 @@ async def refresh_sellers(product_id: int):
 
 @app.post("/api/sellers/refresh-all")
 async def refresh_all_sellers():
-    """SSE-streaming bulk seller refresh — PW own products only."""
+    """SSE-streaming bulk seller refresh — PW own products only.
+
+    Pass 1: BrightData batch (all ASINs in one API call — fast, no IP blocks).
+    Pass 2: Playwright fallback for any ASIN BrightData missed or returned empty.
+    """
     rows = query(
-        "SELECT id, asin_or_sku FROM products WHERE platform='amazon' AND is_own=true ORDER BY id"
+        "SELECT id, asin_or_sku, url FROM products WHERE platform='amazon' AND is_own=true ORDER BY id"
     )
 
     async def generate():
         total = len(rows)
         yield f"data: {json.dumps({'total': total, 'done': 0, 'started': True})}\n\n"
 
-        for i, row in enumerate(rows):
+        row_by_asin = {r["asin_or_sku"]: r for r in rows}
+
+        def _save_listings(product_id: int, listings: list[dict]) -> None:
+            query("DELETE FROM seller_offers WHERE product_id=$1", [product_id])
+            for s in listings:
+                query(
+                    "INSERT INTO seller_offers (product_id,seller_name,price,condition,is_fba,prime_eligible,fetched_at)"
+                    " VALUES ($1,$2,$3,$4,$5,$6,NOW())",
+                    [product_id, s["seller_name"], s["price"], s["condition"], s["is_fba"], s["prime_eligible"]],
+                )
+
+        # ── Pass 1: BrightData batch ─────────────────────────────────────────
+        asin_url_pairs = [{"asin": r["asin_or_sku"], "url": r["url"]} for r in rows]
+        bd_results = await scrape_sellers_via_brightdata(asin_url_pairs)
+        bd_done = 0
+        bd_succeeded: set[str] = set()
+
+        for asin, listings in bd_results.items():
+            row = row_by_asin.get(asin)
+            if not row:
+                continue
+            product_id = row["id"]
+            bd_done += 1
+            if listings:
+                _save_listings(product_id, listings)
+                bd_succeeded.add(asin)
+                yield f"data: {json.dumps({'done': bd_done, 'total': total, 'productId': product_id, 'asin': asin, 'count': len(listings), 'source': 'brightdata'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'done': bd_done, 'total': total, 'productId': product_id, 'asin': asin, 'count': 0, 'source': 'brightdata', 'blocked': True})}\n\n"
+
+        # ── Pass 2: Playwright fallback for missed/empty ASINs ───────────────
+        playwright_rows = [r for r in rows if r["asin_or_sku"] not in bd_succeeded]
+        # If BrightData not configured, scrape everything via Playwright
+        if not bd_results:
+            playwright_rows = list(rows)
+
+        done_count = bd_done
+        for i, row in enumerate(playwright_rows):
             product_id, asin = row["id"], row["asin_or_sku"]
             try:
                 listings = await scrape_offer_listings(asin)
                 if listings:
-                    query("DELETE FROM seller_offers WHERE product_id=$1", [product_id])
-                    for s in listings:
-                        query(
-                            "INSERT INTO seller_offers (product_id,seller_name,price,condition,is_fba,prime_eligible,fetched_at)"
-                            " VALUES ($1,$2,$3,$4,$5,$6,NOW())",
-                            [product_id, s["seller_name"], s["price"], s["condition"], s["is_fba"], s["prime_eligible"]],
-                        )
-                yield f"data: {json.dumps({'done': i+1, 'total': total, 'productId': product_id, 'asin': asin, 'count': len(listings)})}\n\n"
+                    _save_listings(product_id, listings)
+                done_count += 1
+                yield f"data: {json.dumps({'done': done_count, 'total': total, 'productId': product_id, 'asin': asin, 'count': len(listings), 'source': 'playwright'})}\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'done': i+1, 'total': total, 'productId': product_id, 'asin': asin, 'count': 0, 'error': str(e)})}\n\n"
-
-            if i < len(rows) - 1:
+                done_count += 1
+                yield f"data: {json.dumps({'done': done_count, 'total': total, 'productId': product_id, 'asin': asin, 'count': 0, 'error': str(e), 'source': 'playwright'})}\n\n"
+            if i < len(playwright_rows) - 1:
                 await asyncio.sleep(1.5)
 
-        yield f"data: {json.dumps({'done': total, 'total': total, 'finished': True})}\n\n"
+        yield f"data: {json.dumps({'done': total, 'total': total, 'finished': True, 'brightdata_hits': len(bd_succeeded)})}\n\n"
 
     return StreamingResponse(
         generate(),

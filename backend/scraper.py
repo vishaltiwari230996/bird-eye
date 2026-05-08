@@ -1565,6 +1565,164 @@ def parse_product_page(html: str) -> Optional[dict]:
     }
 
 
+# ─── BrightData sellers scraper ──────────────────────────────────────────────
+
+def _map_brightdata_seller_results(
+    results: list[dict], url_to_asin: dict[str, str]
+) -> dict[str, list[dict]]:
+    """Map BrightData 'Amazon sellers info' response to our seller offer shape.
+
+    BrightData returns one item per *seller offer*, not one item per product.
+    Each item has the product URL/ASIN plus seller details.
+    Returns: { asin -> [{"seller_name", "price", "condition", "is_fba", "prime_eligible"}, ...] }
+    """
+    out: dict[str, list[dict]] = {}
+
+    def _to_float(raw) -> Optional[float]:
+        try:
+            return float(str(raw).replace(",", "").replace("₹", "").replace("$", "").strip()) if raw else None
+        except (ValueError, TypeError):
+            return None
+
+    def _is_truthy(raw) -> bool:
+        if raw is None:
+            return False
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).lower() in ("true", "yes", "1", "amazon")
+
+    for item in results:
+        if item.get("error") or item.get("type") == "error":
+            continue
+
+        # Resolve which ASIN this item belongs to
+        item_url = item.get("url") or (item.get("input") or {}).get("url", "")
+        asin = (
+            item.get("asin")
+            or url_to_asin.get(item_url)
+        )
+        # Extract ASIN from URL if needed (e.g. /dp/B0XXXXX)
+        if not asin and item_url:
+            m = re.search(r"/dp/([A-Z0-9]{10})", item_url, re.I)
+            if m:
+                asin = m.group(1).upper()
+        if not asin:
+            continue
+
+        # Seller name — try multiple field names BrightData uses
+        seller_name = (
+            item.get("seller_name")
+            or item.get("seller")
+            or item.get("merchant_name")
+            or item.get("sold_by")
+        )
+        if not seller_name:
+            continue
+
+        price = _to_float(
+            item.get("price")
+            or item.get("final_price")
+            or item.get("selling_price")
+            or item.get("price_excluding_tax")
+        )
+
+        condition = (
+            item.get("condition")
+            or item.get("item_condition")
+            or "New"
+        )
+
+        # FBA: fulfilled by Amazon
+        fulfillment = str(item.get("fulfillment_type") or item.get("fulfillment") or "").lower()
+        is_fba = _is_truthy(item.get("is_fba")) or "amazon" in fulfillment
+
+        prime_eligible = _is_truthy(
+            item.get("prime_eligible")
+            or item.get("is_prime")
+            or item.get("prime")
+        )
+
+        if asin not in out:
+            out[asin] = []
+        out[asin].append({
+            "seller_name": seller_name,
+            "price": price,
+            "condition": condition,
+            "is_fba": is_fba,
+            "prime_eligible": prime_eligible,
+        })
+
+    return out
+
+
+async def scrape_sellers_via_brightdata(asin_url_pairs: list[dict]) -> dict[str, list[dict]]:
+    """Fetch seller listings via BrightData's 'Amazon sellers info' dataset.
+
+    asin_url_pairs: list of {"asin": str, "url": str}
+    Returns: { asin -> [seller offer dicts] }. Empty dict if unconfigured.
+    """
+    token = os.environ.get("BRIGHTDATA_TOKEN", "").strip()
+    dataset_id = os.environ.get("BRIGHTDATA_SELLERS_DATASET_ID", "").strip()
+    if not token or not dataset_id:
+        return {}
+
+    url_to_asin: dict[str, str] = {p["url"]: p["asin"] for p in asin_url_pairs}
+    input_items = [{"url": p["url"], "zipcode": "", "language": ""} for p in asin_url_pairs]
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"https://api.brightdata.com/datasets/v3/scrape"
+                f"?dataset_id={dataset_id}&notify=false&include_errors=true",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={"input": input_items},
+            )
+            r.raise_for_status()
+            resp = r.json()
+    except Exception as e:
+        print(f"[brightdata-sellers] Trigger error: {e}")
+        return {}
+
+    # Synchronous response: data returned directly
+    if isinstance(resp, list):
+        return _map_brightdata_seller_results(resp, url_to_asin)
+
+    # Asynchronous response: poll for snapshot
+    snapshot_id = resp.get("snapshot_id") if isinstance(resp, dict) else None
+    if not snapshot_id:
+        print(f"[brightdata-sellers] Unexpected trigger response: {str(resp)[:200]}")
+        return {}
+
+    print(f"[brightdata-sellers] Polling snapshot {snapshot_id} for {len(asin_url_pairs)} ASINs…")
+    for attempt in range(36):  # max ~6 minutes
+        await asyncio.sleep(10)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    print(f"[brightdata-sellers] Snapshot ready — {len(data)} records (attempt {attempt + 1})")
+                    return _map_brightdata_seller_results(data, url_to_asin)
+            elif r.status_code == 202:
+                continue
+            else:
+                print(f"[brightdata-sellers] Poll error {r.status_code}: {r.text[:200]}")
+                break
+        except Exception as e:
+            print(f"[brightdata-sellers] Poll exception: {e}")
+            break
+
+    print(f"[brightdata-sellers] Timed out waiting for snapshot {snapshot_id}")
+    return {}
+
+
 # ─── BrightData managed scraper ──────────────────────────────────────────────
 
 def _map_brightdata_results(
