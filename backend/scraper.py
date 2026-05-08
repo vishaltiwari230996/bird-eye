@@ -1662,7 +1662,10 @@ async def scrape_sellers_via_brightdata(asin_url_pairs: list[dict]) -> dict[str,
     Returns: { asin -> [seller offer dicts] }. Empty dict if unconfigured.
     """
     token = os.environ.get("BRIGHTDATA_TOKEN", "").strip()
-    dataset_id = os.environ.get("BRIGHTDATA_SELLERS_DATASET_ID", "").strip()
+    dataset_id = (
+        os.environ.get("BRIGHTDATA_SELLERS_DATASET_ID", "").strip()
+        or os.environ.get("BRIGHTDATA_DATASET_ID", "").strip()
+    )
     if not token or not dataset_id:
         return {}
 
