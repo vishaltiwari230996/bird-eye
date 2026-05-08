@@ -1749,7 +1749,21 @@ def _map_brightdata_results(
                 return None
 
         price = _to_float(item.get("price") or item.get("final_price") or item.get("selling_price"))
-        mrp = _to_float(item.get("original_price") or item.get("mrp") or item.get("list_price"))
+        mrp = _to_float(
+            item.get("original_price")
+            or item.get("mrp")
+            or item.get("list_price")
+            or item.get("max_retail_price")
+            or item.get("was_price")
+            or item.get("strike_price")
+            or item.get("crossed_out_price")
+            or item.get("regular_price")
+            or item.get("compare_at_price")
+        )
+        # Sanity: MRP must be greater than selling price
+        selling = _to_float(item.get("price") or item.get("final_price") or item.get("selling_price"))
+        if mrp and selling and mrp <= selling:
+            mrp = None
 
         bsr_raw = item.get("best_sellers_rank") or item.get("best_seller_rank") or item.get("bsr")
         bsr: Optional[str] = None

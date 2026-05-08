@@ -130,6 +130,11 @@ def diff_payloads(prev: dict, next_: dict) -> list[dict]:
     if rc_new > 0 and rc_old != rc_new:
         add("reviewCount", str(int(rc_old)), str(int(rc_new)))
 
+    # MRP
+    m_old, m_new = _num(prev.get("mrp")), _num(next_.get("mrp"))
+    if m_new > 0 and abs(m_old - m_new) > 1:
+        add("mrp", f"₹{m_old}", f"₹{m_new}")
+
     # BSR
     bsr_old, bsr_new = (prev.get("bsr") or ""), (next_.get("bsr") or "")
     if bsr_new and _norm(bsr_old) != _norm(bsr_new):
