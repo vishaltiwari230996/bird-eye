@@ -12,8 +12,18 @@ node_modules/
 
 # Local debug / scratch artifacts
 backend/_inspect.py
+backend/_inspect_*.py
+backend/_pick_*.py
 backend/check_sellers.py
 backend/inspect_olp.py
 backend/debug_*.html
 backend/debug_*.txt
+backend/dbg_*.html
 Use_Eye_Tools.xlsx
+Bird_Eyes_*.xlsx
+
+# Scraping logs (large, noisy, may contain URLs/ASINs)
+*.log
+logs/
+scrape_pw_run*.log
+bulk_scrape.log

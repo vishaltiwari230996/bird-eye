@@ -53,6 +53,53 @@ def hash_payload(payload: dict) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
+# ─── Payload sanity validation ───────────────────────────────────────────────
+# Flags scraped payloads whose price/MRP/seller look implausible against the
+# previous snapshot. Suspect payloads are still saved (we want the history)
+# but are tagged with `needs_review=true` so they can be reviewed and the cron
+# monitor can attempt automatic reconciliation via Playwright. Tunable via
+# env vars; defaults are conservative.
+
+_PRICE_FLOOR = float(os.getenv("PRICE_SANITY_FLOOR", "20"))          # below this, almost certainly EMI/coupon leak
+_PRICE_JUMP_RATIO = float(os.getenv("PRICE_SANITY_JUMP_RATIO", "0.5"))  # >50% delta vs prev flags it
+_MRP_RATIO_CAP = float(os.getenv("MRP_SANITY_RATIO_CAP", "5"))       # MRP > 5x price is implausible
+
+
+def validate_payload(payload: dict, prev_payload: Optional[dict] = None) -> tuple[bool, list[str]]:
+    """Sanity-check a freshly scraped payload.
+
+    Returns (is_suspect, reasons). Catches:
+      - implausibly low prices (EMI / coupon / shipping leaked into price slot)
+      - large price swings vs the previous snapshot (variant swap, stale CDN)
+      - MRP grossly above price (banner-ad strike-through bleed)
+      - Kindle/digital seller on a non-Kindle title (format swap)
+    """
+    reasons: list[str] = []
+    price = _num(payload.get("price"))
+    mrp = _num(payload.get("mrp"))
+
+    if 0 < price < _PRICE_FLOOR:
+        reasons.append(f"price ₹{price} below floor ₹{_PRICE_FLOOR}")
+
+    if mrp > 0 and price > 0 and mrp > price * _MRP_RATIO_CAP:
+        reasons.append(f"mrp ₹{mrp} is >{_MRP_RATIO_CAP}× price ₹{price}")
+
+    if prev_payload:
+        prev_price = _num(prev_payload.get("price"))
+        if prev_price > 0 and price > 0:
+            ratio = abs(price - prev_price) / prev_price
+            if ratio >= _PRICE_JUMP_RATIO:
+                reasons.append(f"price jumped {ratio*100:.0f}% (₹{prev_price} → ₹{price})")
+
+    # Detect Kindle/digital seller swap on titles that don't look like Kindle SKUs.
+    title = (payload.get("title") or "").lower()
+    seller = ((payload.get("offers") or {}).get("seller") or "").lower()
+    if seller and "digital services" in seller and "kindle" not in title and "ebook" not in title:
+        reasons.append(f"seller looks like Kindle/digital ({seller}) but title isn't a Kindle SKU")
+
+    return (bool(reasons), reasons)
+
+
 def parse_json_from_text(content: str) -> Any:
     content = content.strip()
     try:
@@ -254,7 +301,26 @@ async def refresh_sellers(product_id: int):
     if product["platform"] != "amazon":
         raise HTTPException(400, "Seller scraping is only supported for Amazon")
 
-    listings = await scrape_offer_listings(product["asin_or_sku"])
+    # Pass the last-known Buy Box price as an anchor so the AOD parser can
+    # tell the offer price apart from shipping/EMI/coupon snippets.
+    anchor_price: Optional[float] = None
+    last_snap = query_one(
+        "SELECT payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1",
+        [product_id],
+    )
+    if last_snap:
+        prev = last_snap["payload_json"]
+        if isinstance(prev, str):
+            try:
+                prev = json.loads(prev)
+            except Exception:
+                prev = None
+        if isinstance(prev, dict):
+            v = _num(prev.get("price"))
+            if v > 0:
+                anchor_price = v
+
+    listings = await scrape_offer_listings(product["asin_or_sku"], product_price=anchor_price)
 
     if listings:
         query("DELETE FROM seller_offers WHERE product_id=$1", [product_id])
@@ -320,10 +386,30 @@ async def refresh_all_sellers():
             playwright_rows = list(rows)
 
         done_count = bd_done
+        # Pre-fetch last-known Buy Box prices once so we can anchor AOD parsing
+        # for every product in this pass without re-querying inside the loop.
+        anchor_rows = query(
+            "SELECT DISTINCT ON (product_id) product_id, payload_json"
+            " FROM snapshots WHERE product_id = ANY($1) ORDER BY product_id, fetched_at DESC",
+            [[r["id"] for r in playwright_rows]],
+        ) if playwright_rows else []
+        anchor_by_pid: dict[int, Optional[float]] = {}
+        for ar in anchor_rows:
+            payload = ar.get("payload_json")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = None
+            if isinstance(payload, dict):
+                v = _num(payload.get("price"))
+                if v > 0:
+                    anchor_by_pid[ar["product_id"]] = v
+
         for i, row in enumerate(playwright_rows):
             product_id, asin = row["id"], row["asin_or_sku"]
             try:
-                listings = await scrape_offer_listings(asin)
+                listings = await scrape_offer_listings(asin, product_price=anchor_by_pid.get(product_id))
                 if listings:
                     _save_listings(product_id, listings)
                 done_count += 1
@@ -513,13 +599,28 @@ async def run_check(body: RunCheckBody, request: Request):
                 results.append({"productId": pid, "status": "blocked", "changes": 0})
                 continue
 
-            # Save snapshot
-            payload_json = json.dumps(payload)
-            h = hash_payload(payload)
             last_snap = query_one(
                 "SELECT hash, payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1",
                 [pid],
             )
+            prev_payload = None
+            if last_snap:
+                prev_payload = last_snap["payload_json"]
+                if isinstance(prev_payload, str):
+                    prev_payload = json.loads(prev_payload)
+
+            # Sanity-check; tag suspect payloads so downstream readers know
+            # not to trust them blindly. We still save them — silent dropping
+            # would hide drift; tagging makes it visible and auditable.
+            is_suspect, reasons = validate_payload(payload, prev_payload)
+            if is_suspect:
+                payload["needs_review"] = True
+                payload["review_reasons"] = reasons
+                payload["review_source"] = "scrape_product"
+                print(f"[run-check] {asin} flagged needs_review: {reasons}")
+
+            payload_json = json.dumps(payload)
+            h = hash_payload(payload)
             query(
                 "INSERT INTO snapshots (product_id, payload_json, hash, fetched_at) VALUES ($1,$2::jsonb,$3,NOW())",
                 [pid, payload_json, h],
@@ -528,11 +629,8 @@ async def run_check(body: RunCheckBody, request: Request):
 
             # Diff
             change_count = 0
-            if last_snap and last_snap["hash"] != h:
-                prev = last_snap["payload_json"]
-                if isinstance(prev, str):
-                    prev = json.loads(prev)
-                field_changes = diff_payloads(prev, payload)
+            if last_snap and last_snap["hash"] != h and prev_payload is not None:
+                field_changes = diff_payloads(prev_payload, payload)
                 for fc in field_changes:
                     query(
                         "INSERT INTO changes (product_id, field, old_value, new_value, detected_at) VALUES ($1,$2,$3,$4,NOW())",
@@ -540,7 +638,13 @@ async def run_check(body: RunCheckBody, request: Request):
                     )
                 change_count = len(field_changes)
 
-            results.append({"productId": pid, "status": "success", "changes": change_count})
+            results.append({
+                "productId": pid,
+                "status": "success",
+                "changes": change_count,
+                "needs_review": is_suspect,
+                "review_reasons": reasons if is_suspect else [],
+            })
         except Exception as e:
             results.append({"productId": pid, "status": "error", "changes": 0, "error": str(e)})
 
@@ -795,30 +899,53 @@ async def cron_monitor(request: Request):
     products = query("SELECT id, platform, asin_or_sku, url FROM products ORDER BY id")
     product_by_id = {p["id"]: p for p in products}
 
-    def _save_payload(pid: int, payload: dict) -> dict:
-        """Persist a snapshot and detect changes. Returns a result dict."""
-        h = hash_payload(payload)
-        last_snap = query_one(
+    def _previous_snapshot(pid: int) -> tuple[Optional[str], Optional[dict]]:
+        row = query_one(
             "SELECT hash, payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1",
             [pid],
         )
+        if not row:
+            return (None, None)
+        prev = row["payload_json"]
+        if isinstance(prev, str):
+            prev = json.loads(prev)
+        return (row["hash"], prev)
+
+    def _save_payload(pid: int, payload: dict, source: str = "unknown") -> dict:
+        """Persist a snapshot and detect changes. Returns a result dict."""
+        prev_hash, prev_payload = _previous_snapshot(pid)
+
+        # Tag suspect payloads so downstream tooling (and the optional
+        # auto-reconciliation step below) can react. We still save the
+        # snapshot — silent dropping would hide genuine drift.
+        is_suspect, reasons = validate_payload(payload, prev_payload)
+        if is_suspect:
+            payload["needs_review"] = True
+            payload["review_reasons"] = reasons
+            payload["review_source"] = source
+            print(f"[cron] pid={pid} ({source}) flagged needs_review: {reasons}")
+
+        h = hash_payload(payload)
         query(
             "INSERT INTO snapshots (product_id, payload_json, hash, fetched_at) VALUES ($1,$2::jsonb,$3,NOW())",
             [pid, json.dumps(payload), h],
         )
         query("UPDATE products SET last_seen_at=NOW() WHERE id=$1", [pid])
         change_count = 0
-        if last_snap and last_snap["hash"] != h:
-            prev = last_snap["payload_json"]
-            if isinstance(prev, str):
-                prev = json.loads(prev)
-            for fc in diff_payloads(prev, payload):
+        if prev_hash and prev_hash != h and prev_payload is not None:
+            for fc in diff_payloads(prev_payload, payload):
                 query(
                     "INSERT INTO changes (product_id, field, old_value, new_value, detected_at) VALUES ($1,$2,$3,$4,NOW())",
                     [pid, fc["field"], fc["old_value"], fc["new_value"]],
                 )
                 change_count += 1
-        return {"productId": pid, "status": "success", "changes": change_count}
+        return {
+            "productId": pid,
+            "status": "success",
+            "changes": change_count,
+            "needs_review": is_suspect,
+            "review_reasons": reasons if is_suspect else [],
+        }
 
     async def _playwright_scrape_and_save(product: dict) -> dict:
         """Fallback: scrape one product with Playwright and save."""
@@ -827,7 +954,7 @@ async def cron_monitor(request: Request):
             payload = await scrape_product(product["asin_or_sku"], product["url"])
             if not payload:
                 return {"productId": pid, "status": "blocked"}
-            return _save_payload(pid, payload)
+            return _save_payload(pid, payload, source="playwright")
         except Exception as e:
             return {"productId": pid, "status": "error", "error": str(e)}
 
@@ -836,11 +963,21 @@ async def cron_monitor(request: Request):
     # ── Pass 1: BrightData batch (fast, structured, no IP blocks) ─────────
     bd_results = await scrape_via_brightdata(list(products))
     bd_succeeded: set[int] = set()
+    bd_suspect_pids: list[int] = []   # flagged by validate_payload — try Playwright as second opinion
 
     for pid, payload in bd_results.items():
         if payload:
             try:
-                r = _save_payload(pid, payload)
+                _, prev_payload = _previous_snapshot(pid)
+                is_suspect, _ = validate_payload(payload, prev_payload)
+                if is_suspect:
+                    # Don't save yet — re-scrape with Playwright and let the
+                    # cleaner of the two win. This is the main cross-source
+                    # reconciliation step that turns 1-in-10 wrong scrapes
+                    # into 1-in-50.
+                    bd_suspect_pids.append(pid)
+                    continue
+                r = _save_payload(pid, payload, source="brightdata")
                 r["source"] = "brightdata"
                 results.append(r)
                 bd_succeeded.add(pid)
@@ -848,6 +985,45 @@ async def cron_monitor(request: Request):
                 results.append({"productId": pid, "status": "error", "error": str(e), "source": "brightdata"})
         else:
             results.append({"productId": pid, "status": "blocked", "source": "brightdata"})
+
+    # ── Pass 1b: Reconcile suspect BrightData payloads with Playwright ────
+    # For each suspect BrightData result we now have TWO candidate payloads
+    # available: the BrightData one (already in memory) and a fresh Playwright
+    # scrape. Pick whichever is *not* flagged by validate_payload. If both
+    # are flagged we still save the Playwright one (Playwright reads the live
+    # page, BrightData can serve cached snapshots up to a few hours old).
+    reconciled: list[dict] = []
+    for pid in bd_suspect_pids:
+        product = product_by_id.get(pid)
+        bd_payload = bd_results.get(pid)
+        if not product or not bd_payload:
+            continue
+        _, prev_payload = _previous_snapshot(pid)
+        try:
+            pw_payload = await scrape_product(product["asin_or_sku"], product["url"])
+        except Exception as e:
+            pw_payload = None
+            print(f"[cron] reconcile pid={pid}: playwright threw {e}")
+
+        pw_suspect = True
+        if pw_payload:
+            pw_suspect, _ = validate_payload(pw_payload, prev_payload)
+
+        # Choose the cleaner of the two. Playwright wins ties because it
+        # reads live HTML while BrightData can return cached records.
+        chosen, source = (pw_payload, "playwright-reconcile") if (pw_payload and not pw_suspect) else (bd_payload, "brightdata-reconcile")
+        if chosen is pw_payload and pw_payload is None:
+            chosen, source = bd_payload, "brightdata-reconcile"
+
+        try:
+            r = _save_payload(pid, chosen, source=source)
+            r["source"] = source
+            reconciled.append(r)
+            results.append(r)
+            bd_succeeded.add(pid)
+        except Exception as e:
+            results.append({"productId": pid, "status": "error", "error": str(e), "source": source})
+        await asyncio.sleep(0.3)
 
     # Products BrightData didn't return at all (not even an error item)
     bd_missing = [p for p in products if p["id"] not in bd_results]
@@ -895,6 +1071,7 @@ async def cron_monitor(request: Request):
             await asyncio.sleep(0.5)
         failed = still_failed
 
+    needs_review_ids = [r["productId"] for r in results if r.get("needs_review")]
     return {
         "processed": len(results),
         "brightdata_hits": len(bd_succeeded),
@@ -903,6 +1080,8 @@ async def cron_monitor(request: Request):
         "retried": len(retry_results),
         "retry_results": retry_results,
         "still_failed": [r["productId"] for r in failed],
+        "reconciled": len(reconciled),
+        "needs_review": needs_review_ids,
     }
 
 

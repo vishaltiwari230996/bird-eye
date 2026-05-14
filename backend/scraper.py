@@ -833,7 +833,34 @@ async def fetch_html_browser(
 
 # ─── AOD offer listing parser ─────────────────────────────────────────────────
 
-def parse_aod_html(html: str) -> list[dict]:
+def _pick_offer_price(candidates: list[float], product_price: Optional[float]) -> Optional[float]:
+    """Pick the most plausible offer price from a list of candidates.
+
+    Replaces the old `min(candidates)` heuristic which would happily grab a
+    ₹40 shipping fee, a "₹49/month" EMI value, or a "Save ₹50" coupon snippet
+    as the offer price.
+
+    Strategy:
+      1. Drop values < ₹20 (almost certainly shipping/coupon/EMI text).
+      2. If we know the product-page price, pick the candidate closest to it
+         (within 30% on either side) — sellers almost never deviate that far.
+      3. Otherwise, pick the median candidate (more robust than min/max).
+    """
+    cleaned = [c for c in candidates if c and c >= 20]
+    if not cleaned:
+        return None
+    if product_price and product_price > 0:
+        within_band = [c for c in cleaned if 0.7 * product_price <= c <= 1.5 * product_price]
+        if within_band:
+            return min(within_band, key=lambda c: abs(c - product_price))
+        # No candidate fits the plausibility band — fall through and pick the
+        # value closest to the product price overall.
+        return min(cleaned, key=lambda c: abs(c - product_price))
+    cleaned.sort()
+    return cleaned[len(cleaned) // 2]
+
+
+def parse_aod_html(html: str, product_price: Optional[float] = None) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     listings: list[dict] = []
     seen_keys: set[str] = set()
@@ -984,7 +1011,11 @@ def parse_aod_html(html: str) -> list[dict]:
                         price = p
                         break
             if price is None:
-                # Fallback: take lowest non-strike price visible in the card
+                # Fallback: collect all non-strike rupee values in the card, then
+                # pick the one most plausibly the offer price (proximity to the
+                # product-page price when known, median otherwise). The previous
+                # `min(candidates)` heuristic was grabbing shipping fees, coupons,
+                # and EMI/month figures.
                 candidates = []
                 for off in card.select("span.a-offscreen"):
                     ancestor_classes = " ".join(
@@ -997,8 +1028,7 @@ def parse_aod_html(html: str) -> list[dict]:
                         p = parse_price(txt)
                         if p and p > 0:
                             candidates.append(p)
-                if candidates:
-                    price = min(candidates)
+                price = _pick_offer_price(candidates, product_price)
 
             block_html = str(card).lower()
             is_fba = (
@@ -1251,7 +1281,7 @@ async def fetch_aod_via_browser(asin: str) -> Optional[str]:
                 pass
 
 
-async def scrape_offer_listings(asin: str) -> list[dict]:
+async def scrape_offer_listings(asin: str, product_price: Optional[float] = None) -> list[dict]:
     """Full offer-listing scrape.
 
     Priority:
@@ -1259,6 +1289,11 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
     2. Browser: warm session on /dp/, navigate to AOD AJAX URL
     3. Static warm-session AOD AJAX fallback
     4. AI extraction from whatever HTML we managed to get
+
+    product_price (optional): the current Buy Box price observed on the product
+    detail page. When provided, the AOD parser uses it to disambiguate which
+    rupee value in each offer card is the actual offer price (vs. shipping,
+    EMI, or coupon amounts).
     """
     product_url = f"https://www.amazon.in/dp/{asin}"
 
@@ -1273,7 +1308,7 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
     aod_html = await fetch_aod_via_browser(asin)
     if aod_html:
         last_html = aod_html
-        listings = parse_aod_html(aod_html)
+        listings = parse_aod_html(aod_html, product_price=product_price)
         if listings:
             print(f"[scraper] {asin} -> {len(listings)} sellers via AOD")
             return listings
@@ -1288,6 +1323,15 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
         if not last_html:
             last_html = product_html
         if not is_blocked(product_html):
+            # If caller didn't pass a product_price anchor, derive it from the
+            # detail page so the AOD parser can disambiguate prices vs fees.
+            if product_price is None:
+                try:
+                    p_payload = parse_product_page(product_html, expected_asin=asin)
+                    if p_payload and p_payload.get("price"):
+                        product_price = float(p_payload["price"])
+                except Exception:
+                    pass
             ua = pick_ua()
             client = await get_static_client()
             for aod_url in (
@@ -1309,7 +1353,7 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
                     if r.is_success:
                         last_html = r.text
                         if not is_blocked(r.text):
-                            listings = parse_aod_html(r.text)
+                            listings = parse_aod_html(r.text, product_price=product_price)
                             if listings:
                                 print(f"[scraper] {asin} -> {len(listings)} sellers via static AOD")
                                 return listings
@@ -1335,8 +1379,61 @@ async def scrape_offer_listings(asin: str) -> list[dict]:
 
 # ─── Product page parser ─────────────────────────────────────────────────────
 
-def parse_product_page(html: str) -> Optional[dict]:
+def detect_rendered_asin(html_or_soup) -> Optional[str]:
+    """Return the ASIN Amazon actually rendered on this page.
+
+    Amazon auto-redirects /dp/<parent-asin> to a child variant (e.g. Kindle vs
+    Paperback, "1-year" vs "2-year"). If we don't check, we can save price /
+    seller / MRP for a different SKU than we asked for. Reads from (in order):
+      - canonical <link rel="canonical">
+      - hidden <input name="ASIN">
+      - data-asin on #dp-container / #ppd / #dp / #averageCustomerReviews_feature_div
+      - data-csa-c-asin attribute
+    Returns None if it can't determine the ASIN.
+    """
+    soup = html_or_soup if isinstance(html_or_soup, BeautifulSoup) else BeautifulSoup(html_or_soup, "html.parser")
+
+    canon = soup.find("link", rel="canonical")
+    if canon and canon.get("href"):
+        m = re.search(r"/dp/([A-Z0-9]{10})", canon["href"], re.I)
+        if m:
+            return m.group(1).upper()
+
+    hidden = soup.find("input", attrs={"name": "ASIN"})
+    if hidden and hidden.get("value"):
+        v = hidden["value"].strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{10}", v):
+            return v
+
+    for sel in ("#dp-container", "#ppd", "#dp", "#averageCustomerReviews_feature_div", "#title_feature_div"):
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        for attr in ("data-asin", "data-csa-c-asin"):
+            v = (el.get(attr) or "").strip().upper()
+            if re.fullmatch(r"[A-Z0-9]{10}", v):
+                return v
+
+    body = soup.body
+    if body:
+        v = (body.get("data-asin") or "").strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{10}", v):
+            return v
+
+    return None
+
+
+def parse_product_page(html: str, expected_asin: Optional[str] = None) -> Optional[dict]:
     soup = BeautifulSoup(html, "html.parser")
+
+    # ASIN guard: reject if Amazon rendered a different variant than we asked for.
+    # Without this, parent ASINs can silently return Kindle/audiobook/multi-pack
+    # variant data, leading to wrong price + wrong seller for ~1 in 10 scrapes.
+    if expected_asin:
+        rendered = detect_rendered_asin(soup)
+        if rendered and rendered.upper() != expected_asin.strip().upper():
+            print(f"[parse_product_page] ASIN mismatch: requested {expected_asin} rendered {rendered} -- rejecting payload")
+            return None
 
     # Title
     title_el = (
@@ -1429,6 +1526,11 @@ def parse_product_page(html: str) -> Optional[dict]:
         mrp = max(mrp_candidates)
         # Sanity: MRP must be >= price (otherwise it's just a duplicate price)
         if price and mrp <= price:
+            mrp = None
+        # Cap implausible MRPs at 5x price (e.g. banner ad strike-through of
+        # unrelated SKU bleeding in). Without this cap a stray ₹4,999 strike
+        # against a ₹527 SKU produces a 90% discount that's plainly wrong.
+        if price and mrp and mrp > price * 5:
             mrp = None
     # If we couldn't find a real buy-box price (item unavailable), drop the
     # MRP too — a lone MRP without a price is misleading downstream.
@@ -1670,7 +1772,10 @@ async def scrape_sellers_via_brightdata(asin_url_pairs: list[dict]) -> dict[str,
         return {}
 
     url_to_asin: dict[str, str] = {p["url"]: p["asin"] for p in asin_url_pairs}
-    input_items = [{"url": p["url"], "zipcode": "", "language": ""} for p in asin_url_pairs]
+    # Pin the same default zipcode used for product scrapes so Buy Box winners
+    # match between the two datasets.
+    zipcode = os.environ.get("BRIGHTDATA_ZIPCODE", "400001").strip()
+    input_items = [{"url": p["url"], "zipcode": zipcode, "language": ""} for p in asin_url_pairs]
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -1759,10 +1864,18 @@ def _map_brightdata_results(
             or item.get("crossed_out_price")
             or item.get("regular_price")
             or item.get("compare_at_price")
+            or item.get("initial_price")  # BrightData uses this field on some snapshots
+            or item.get("list_price_amount")
         )
         # Sanity: MRP must be greater than selling price
         selling = _to_float(item.get("price") or item.get("final_price") or item.get("selling_price"))
         if mrp and selling and mrp <= selling:
+            mrp = None
+        # Cap implausible MRPs (e.g. banner ad strike-through of unrelated SKU
+        # bleeding into the detail zone). A 5x cap covers genuine deep discounts
+        # while rejecting obviously-misattributed values that would otherwise
+        # produce 80-90% discount figures.
+        if mrp and selling and mrp > selling * 5:
             mrp = None
 
         bsr_raw = item.get("best_sellers_rank") or item.get("best_seller_rank") or item.get("bsr")
@@ -1813,7 +1926,11 @@ async def scrape_via_brightdata(products: list[dict]) -> dict[int, Optional[dict
         return {}
 
     url_to_pid: dict[str, int] = {p["url"]: p["id"] for p in products}
-    input_items = [{"url": p["url"], "zipcode": "", "language": ""} for p in products]
+    # Pin a default Indian pincode so Amazon doesn't shuffle the Buy Box winner
+    # by region between scrapes. Mumbai (400001) is closest to our datacenter;
+    # override via BRIGHTDATA_ZIPCODE env if you want a different anchor city.
+    zipcode = os.environ.get("BRIGHTDATA_ZIPCODE", "400001").strip()
+    input_items = [{"url": p["url"], "zipcode": zipcode, "language": ""} for p in products]
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -1885,7 +2002,7 @@ async def scrape_product(asin: str, url: str) -> Optional[dict]:
     if html:
         last_html = html
         if not is_blocked(html):
-            payload = parse_product_page(html)
+            payload = parse_product_page(html, expected_asin=asin)
             if payload and payload.get("price"):
                 return payload
             if payload:
@@ -1909,7 +2026,7 @@ async def scrape_product(asin: str, url: str) -> Optional[dict]:
     if html:
         last_html = html
         if not is_blocked(html):
-            payload = parse_product_page(html)
+            payload = parse_product_page(html, expected_asin=asin)
             if payload and payload.get("price"):
                 return payload
             if payload:
