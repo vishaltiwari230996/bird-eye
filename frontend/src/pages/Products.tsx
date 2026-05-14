@@ -64,6 +64,12 @@ interface Card {
   insights: ChangeInsight[];
   changeFlags: Record<ChangeKind, RecentChange | null>;
   sellers: SellerOffer[];
+  // True when the backend sanity-checker flagged the latest snapshot as
+  // implausible (price below floor, MRP > 5× price, large jump vs prev, or
+  // a Kindle/digital-services seller on a non-Kindle title). The snapshot
+  // is still shown — the badge just tells operators not to trust it.
+  needsReview: boolean;
+  reviewReasons: string[];
 }
 
 function timeAgo(iso: string | null): string {
@@ -174,6 +180,10 @@ export default function Products() {
       const insights = changes.slice(0, 3).map(summarizeChange);
       const cardPools = poolNamesById.get(p.id) ?? [];
       const brand = cardPools.length ? brandFromPoolName(cardPools[0]) : 'Other';
+      const needsReview = payload.needs_review === true;
+      const reviewReasons: string[] = Array.isArray(payload.review_reasons)
+        ? payload.review_reasons.filter((r: unknown): r is string => typeof r === 'string')
+        : [];
       return {
         id: p.id,
         platform: p.platform,
@@ -195,6 +205,8 @@ export default function Products() {
         insights,
         changeFlags: buildChangeFlags(changes),
         sellers: p.seller_offers ?? [],
+        needsReview,
+        reviewReasons,
       };
     });
   };
@@ -318,6 +330,10 @@ export default function Products() {
       avgPrice: prices.length ? prices.reduce((a, b) => a + b, 0) / prices.length : null,
       avgRating: ratings.length ? ratings.reduce((a, b) => a + b, 0) / ratings.length : null,
       withChange: cards.filter((c) => c.insights.length).length,
+      // SKUs whose latest snapshot failed backend sanity checks. Shown so
+      // operators can spot data-quality issues at a glance rather than
+      // browsing every row.
+      needsReview: cards.filter((c) => c.needsReview).length,
     };
   }, [cards]);
 
@@ -343,6 +359,12 @@ export default function Products() {
           <div><div className="kicker">PW SKUs</div><div className="metric-val">{stats.pw}</div></div>
           <div><div className="kicker">Avg Price</div><div className="metric-val">{formatINR(stats.avgPrice)}</div></div>
           <div><div className="kicker">Moving</div><div className="metric-val">{stats.withChange}</div></div>
+          {stats.needsReview > 0 && (
+            <div title="SKUs whose latest scrape was flagged as implausible by backend sanity checks. Click 'Run check' on each to re-scrape.">
+              <div className="kicker" style={{ color: 'var(--ochre, #a87a2a)' }}>Needs Review</div>
+              <div className="metric-val" style={{ color: 'var(--ochre, #a87a2a)' }}>{stats.needsReview}</div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -579,7 +601,24 @@ function ProductRow({
           <span className="chip-platform">{card.platform}</span>
         </div>
 
-        <div className="sku-table__cell-num">{formatINR(card.price)}</div>
+        <div className="sku-table__cell-num">
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', justifyContent: 'flex-end' }}>
+            {formatINR(card.price)}
+            {card.needsReview && (
+              <span
+                className="chip chip-amber"
+                title={
+                  card.reviewReasons.length
+                    ? `Scrape flagged for review:\n• ${card.reviewReasons.join('\n• ')}`
+                    : 'Scrape flagged for review'
+                }
+                style={{ fontSize: '10px', padding: '1px 6px', lineHeight: 1.4 }}
+              >
+                review
+              </span>
+            )}
+          </span>
+        </div>
 
         <div className="sku-table__cell-num">
           {card.rating != null ? `★ ${card.rating.toFixed(1)}` : '—'}
