@@ -346,6 +346,58 @@ async def get_sellers(product_id: int):
     return rows
 
 
+@app.get("/api/sellers/diagnose")
+async def diagnose_seller_sources():
+    """Report which seller-data sources are configured on this deployment.
+
+    Useful when troubleshooting why /api/sellers/refresh-all returns 0
+    listings — tells you at a glance whether the failure is "no source
+    configured" or "configured source isn't working". Never leaks
+    secrets; only reports yes/no flags and the suffix of any ID.
+    """
+    def tail(v: str, n: int = 6) -> str:
+        v = (v or "").strip()
+        return f"…{v[-n:]}" if len(v) > n else ("(empty)" if not v else v)
+
+    bd_token = os.environ.get("BRIGHTDATA_TOKEN", "").strip()
+    bd_product = os.environ.get("BRIGHTDATA_DATASET_ID", "").strip()
+    bd_sellers = os.environ.get("BRIGHTDATA_SELLERS_DATASET_ID", "").strip()
+    az_key    = os.environ.get("AMAZON_ACCESS_KEY", "").strip()
+    az_secret = os.environ.get("AMAZON_SECRET_KEY", "").strip()
+    az_tag    = os.environ.get("AMAZON_PARTNER_TAG", "").strip()
+
+    return {
+        "paapi": {
+            "configured": bool(az_key and az_secret and az_tag),
+            "access_key_suffix": tail(az_key),
+            "partner_tag": az_tag or "(empty)",
+        },
+        "brightdata_sellers": {
+            "configured": bool(bd_token and bd_sellers),
+            "token_present": bool(bd_token),
+            "dataset_id_suffix": tail(bd_sellers),
+            "falls_back_to_product_dataset": bool(bd_token and not bd_sellers and bd_product),
+        },
+        "brightdata_product": {
+            "configured": bool(bd_token and bd_product),
+            "dataset_id_suffix": tail(bd_product),
+        },
+        "playwright": {
+            "note": "Playwright always 'attempts' to run on this deployment but in practice "
+                    "returns 0 listings on Hugging Face Spaces due to browser/memory limits.",
+        },
+        "static_aod_ajax": {
+            "note": "Direct httpx fetch of Amazon's /gp/aod/ajax endpoint. Usually blocked from "
+                    "datacenter IPs (Hugging Face Spaces) — Amazon returns captcha/503.",
+        },
+        "summary": (
+            "Configure BRIGHTDATA_SELLERS_DATASET_ID (cheapest, fastest) or PA-API credentials "
+            "(free, slower) to enable full multi-seller scraping. With neither, the only seller "
+            "data captured is the buy-box winner (mirrored from each product-page snapshot)."
+        ),
+    }
+
+
 @app.post("/api/products/{product_id}/sellers")
 async def refresh_sellers(product_id: int):
     product = query_one("SELECT * FROM products WHERE id=$1", [product_id])
