@@ -346,6 +346,81 @@ async def get_sellers(product_id: int):
     return rows
 
 
+@app.get("/api/sellers/debug-brightdata")
+async def debug_brightdata_response(request: Request, asin: str):
+    """Debug: fetch one product via BrightData and return the raw response keys.
+
+    Helps us decide whether BrightData's existing product dataset already
+    includes seller / offer-listing fields — in which case we can extract
+    them during the regular product scrape and skip configuring a separate
+    sellers dataset entirely.
+    """
+    cron_secret = os.getenv("CRON_SECRET", "")
+    auth = request.headers.get("authorization", "").replace("Bearer ", "")
+    if cron_secret and auth != cron_secret:
+        raise HTTPException(401, "Unauthorized")
+
+    token = os.environ.get("BRIGHTDATA_TOKEN", "").strip()
+    dataset_id = os.environ.get("BRIGHTDATA_DATASET_ID", "").strip()
+    if not token or not dataset_id:
+        return {"error": "BrightData not configured"}
+
+    url = f"https://www.amazon.in/dp/{asin}"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                f"https://api.brightdata.com/datasets/v3/scrape"
+                f"?dataset_id={dataset_id}&notify=false&include_errors=true",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"input": [{"url": url, "zipcode": "400001", "language": ""}]},
+            )
+            r.raise_for_status()
+            resp = r.json()
+    except Exception as e:
+        return {"error": f"BrightData call failed: {e}"}
+
+    # Async path — poll once briefly so we can see what comes back
+    if isinstance(resp, dict) and resp.get("snapshot_id"):
+        snapshot_id = resp["snapshot_id"]
+        async with httpx.AsyncClient(timeout=120) as client:
+            for _ in range(18):
+                await asyncio.sleep(5)
+                r = await client.get(
+                    f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if r.status_code == 200 and isinstance(r.json(), list):
+                    resp = r.json()
+                    break
+                if r.status_code != 202:
+                    return {"error": f"poll {r.status_code}: {r.text[:200]}"}
+            else:
+                return {"error": "polling timed out"}
+
+    if not isinstance(resp, list) or not resp:
+        return {"raw_top_keys": list(resp.keys()) if isinstance(resp, dict) else None, "raw": str(resp)[:500]}
+
+    item = resp[0]
+    if not isinstance(item, dict):
+        return {"raw": str(item)[:500]}
+
+    # Pull out anything seller / offer related
+    seller_related = {}
+    for k, v in item.items():
+        kl = k.lower()
+        if any(needle in kl for needle in ("seller", "offer", "buy_box", "buybox", "merchant", "vendor")):
+            seller_related[k] = v if not isinstance(v, (list, dict)) else (str(v)[:400] + "..." if len(str(v)) > 400 else v)
+
+    return {
+        "all_keys": sorted(item.keys()),
+        "seller_offer_related_fields": seller_related,
+        "summary": (
+            f"BrightData returned {len(item.keys())} fields for {asin}. "
+            f"Found {len(seller_related)} seller/offer-related fields."
+        ),
+    }
+
+
 @app.get("/api/sellers/diagnose")
 async def diagnose_seller_sources():
     """Report which seller-data sources are configured on this deployment.
