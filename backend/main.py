@@ -69,6 +69,7 @@ def validate_payload(payload: dict, prev_payload: Optional[dict] = None) -> tupl
     """Sanity-check a freshly scraped payload.
 
     Returns (is_suspect, reasons). Catches:
+      - missing/zero price (scrape was blocked or Amazon returned a stub page)
       - implausibly low prices (EMI / coupon / shipping leaked into price slot)
       - large price swings vs the previous snapshot (variant swap, stale CDN)
       - MRP grossly above price (banner-ad strike-through bleed)
@@ -77,6 +78,12 @@ def validate_payload(payload: dict, prev_payload: Optional[dict] = None) -> tupl
     reasons: list[str] = []
     price = _num(payload.get("price"))
     mrp = _num(payload.get("mrp"))
+
+    # Price missing entirely is almost always Amazon blocking us and returning a
+    # captcha / stub HTML. Tag it so callers can decide whether to overwrite a
+    # known-good prior snapshot with this empty one (they usually shouldn't).
+    if payload.get("price") in (None, "", 0) or price <= 0:
+        reasons.append("price missing — scrape likely blocked")
 
     if 0 < price < _PRICE_FLOOR:
         reasons.append(f"price ₹{price} below floor ₹{_PRICE_FLOOR}")
@@ -98,6 +105,46 @@ def validate_payload(payload: dict, prev_payload: Optional[dict] = None) -> tupl
         reasons.append(f"seller looks like Kindle/digital ({seller}) but title isn't a Kindle SKU")
 
     return (bool(reasons), reasons)
+
+
+def _upsert_buybox_seller_offer(pid: int, payload: dict) -> None:
+    """Mirror the freshly-scraped buy-box seller into the seller_offers table.
+
+    Why this exists: /api/sellers/refresh-all relies on Playwright (or PA-API
+    creds), and on Hugging Face Spaces Playwright frequently returns zero
+    listings (memory limits, no persistent browser binary, anti-bot blocks).
+    Every product-page scrape ALREADY knows the current buy-box seller and
+    price — we just weren't writing it anywhere. This function records that
+    snapshot into seller_offers so the PW Table's Cocoblu/Repro/PW columns
+    stay in sync with the buy-box automatically, without ever invoking the
+    fragile dedicated seller refresh.
+
+    Strategy:
+      • Sweep any rows for this product older than 24h (stale May-vintage
+        rows would otherwise drown out today's value when the frontend
+        takes min(price) per seller pattern).
+      • Insert a fresh row for the buy-box seller. We don't UPDATE in place
+        because the historic table can carry multiple sellers per product
+        from a real multi-seller refresh; we want the buy-box winner to be
+        an additional, freshly-timestamped row that the frontend will pick.
+    """
+    offers = payload.get("offers") or {}
+    seller = (offers.get("seller") or "").strip()
+    price = _num(payload.get("price"))
+    if not seller or price <= 0:
+        return
+    try:
+        query(
+            "DELETE FROM seller_offers WHERE product_id=$1 AND fetched_at < NOW() - INTERVAL '24 hours'",
+            [pid],
+        )
+        query(
+            "INSERT INTO seller_offers (product_id, seller_name, price, condition, is_fba, prime_eligible, fetched_at)"
+            " VALUES ($1,$2,$3,$4,$5,$6,NOW())",
+            [pid, seller, price, "New", False, False],
+        )
+    except Exception as e:
+        print(f"[upsert-seller] pid={pid} skipped: {e}")
 
 
 def parse_json_from_text(content: str) -> Any:
@@ -332,6 +379,62 @@ async def refresh_sellers(product_id: int):
             )
 
     return {"count": len(listings), "sellers": listings}
+
+
+@app.post("/api/sellers/backfill-from-snapshots")
+async def backfill_sellers_from_snapshots(request: Request):
+    """One-shot: mirror buy-box seller from latest snapshot into seller_offers.
+
+    Why: /api/sellers/refresh-all relies on Playwright, which is unreliable on
+    Hugging Face Spaces. But every product-page snapshot already carries the
+    current buy-box seller in payload.offers.seller. This endpoint walks the
+    most recent snapshot of every Amazon product and writes that seller into
+    the seller_offers table, so the PW Table's Cocoblu / Repro / PW columns
+    reflect today's reality without a single re-scrape.
+
+    Safe to run repeatedly. Existing rows older than 24h get swept; the fresh
+    buy-box row gets inserted with NOW() as fetched_at.
+    """
+    cron_secret = os.getenv("CRON_SECRET", "")
+    auth = request.headers.get("authorization", "").replace("Bearer ", "")
+    if cron_secret and auth != cron_secret:
+        raise HTTPException(401, "Unauthorized")
+
+    rows = query(
+        "SELECT DISTINCT ON (s.product_id) s.product_id, s.payload_json"
+        "  FROM snapshots s"
+        "  JOIN products p ON p.id = s.product_id"
+        " WHERE p.platform='amazon'"
+        " ORDER BY s.product_id, s.fetched_at DESC"
+    )
+
+    seeded = 0
+    skipped = 0
+    for r in rows:
+        payload = r["payload_json"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            skipped += 1
+            continue
+        offers = payload.get("offers") or {}
+        seller = (offers.get("seller") or "").strip()
+        price = _num(payload.get("price"))
+        if not seller or price <= 0:
+            skipped += 1
+            continue
+        _upsert_buybox_seller_offer(r["product_id"], payload)
+        seeded += 1
+
+    return {
+        "scanned": len(rows),
+        "seeded": seeded,
+        "skipped": skipped,
+        "message": f"Wrote {seeded} buy-box rows into seller_offers from latest snapshots",
+    }
 
 
 @app.post("/api/sellers/refresh-all")
@@ -613,6 +716,18 @@ async def run_check(body: RunCheckBody, request: Request):
             # not to trust them blindly. We still save them — silent dropping
             # would hide drift; tagging makes it visible and auditable.
             is_suspect, reasons = validate_payload(payload, prev_payload)
+
+            if _num(payload.get("price")) <= 0 and prev_payload and _num(prev_payload.get("price")) > 0:
+                print(f"[run-check] {asin} SKIPPED save — empty payload, prior good snapshot kept")
+                results.append({
+                    "productId": pid,
+                    "status": "skipped_empty",
+                    "changes": 0,
+                    "needs_review": True,
+                    "review_reasons": reasons,
+                })
+                continue
+
             if is_suspect:
                 payload["needs_review"] = True
                 payload["review_reasons"] = reasons
@@ -626,6 +741,7 @@ async def run_check(body: RunCheckBody, request: Request):
                 [pid, payload_json, h],
             )
             query("UPDATE products SET last_seen_at=NOW() WHERE id=$1", [pid])
+            _upsert_buybox_seller_offer(pid, payload)
 
             # Diff
             change_count = 0
@@ -919,6 +1035,21 @@ async def cron_monitor(request: Request):
         # auto-reconciliation step below) can react. We still save the
         # snapshot — silent dropping would hide genuine drift.
         is_suspect, reasons = validate_payload(payload, prev_payload)
+
+        # Special case: if this scrape has no price at all but a previous
+        # good snapshot exists, refuse to overwrite. A blocked / captcha
+        # response would otherwise replace correct data with NULLs, which
+        # is what made the frontend show "wrong details" earlier.
+        if _num(payload.get("price")) <= 0 and prev_payload and _num(prev_payload.get("price")) > 0:
+            print(f"[cron] pid={pid} ({source}) SKIPPED save — empty payload, prior good snapshot kept")
+            return {
+                "productId": pid,
+                "status": "skipped_empty",
+                "changes": 0,
+                "needs_review": True,
+                "review_reasons": reasons,
+            }
+
         if is_suspect:
             payload["needs_review"] = True
             payload["review_reasons"] = reasons
@@ -931,6 +1062,7 @@ async def cron_monitor(request: Request):
             [pid, json.dumps(payload), h],
         )
         query("UPDATE products SET last_seen_at=NOW() WHERE id=$1", [pid])
+        _upsert_buybox_seller_offer(pid, payload)
         change_count = 0
         if prev_hash and prev_hash != h and prev_payload is not None:
             for fc in diff_payloads(prev_payload, payload):
