@@ -123,10 +123,12 @@ def _upsert_buybox_seller_offer(pid: int, payload: dict) -> None:
       • Sweep any rows for this product older than 24h (stale May-vintage
         rows would otherwise drown out today's value when the frontend
         takes min(price) per seller pattern).
-      • Insert a fresh row for the buy-box seller. We don't UPDATE in place
-        because the historic table can carry multiple sellers per product
-        from a real multi-seller refresh; we want the buy-box winner to be
-        an additional, freshly-timestamped row that the frontend will pick.
+      • Sweep any prior row for the SAME seller on this product, so
+        repeated cron runs in the same day don't accumulate duplicates.
+      • Insert a fresh row for the buy-box seller. We don't blindly
+        delete every row for this product because a real multi-seller
+        refresh may have stored Cocoblu + Repro + PW concurrently — we
+        only want to refresh the row for the seller we just observed.
     """
     offers = payload.get("offers") or {}
     seller = (offers.get("seller") or "").strip()
@@ -137,6 +139,10 @@ def _upsert_buybox_seller_offer(pid: int, payload: dict) -> None:
         query(
             "DELETE FROM seller_offers WHERE product_id=$1 AND fetched_at < NOW() - INTERVAL '24 hours'",
             [pid],
+        )
+        query(
+            "DELETE FROM seller_offers WHERE product_id=$1 AND seller_name=$2",
+            [pid, seller],
         )
         query(
             "INSERT INTO seller_offers (product_id, seller_name, price, condition, is_fba, prime_eligible, fetched_at)"
