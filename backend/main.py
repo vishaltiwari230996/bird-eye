@@ -408,6 +408,20 @@ async def backfill_sellers_from_snapshots(request: Request):
         " ORDER BY s.product_id, s.fetched_at DESC"
     )
 
+    # Sweep ALL stale (>24h) rows up front, regardless of whether we'll have
+    # a fresh row to insert. Otherwise stale May-vintage rows would survive
+    # for products where the latest snapshot didn't manage to capture a seller
+    # name — and the frontend would still display them as if fresh.
+    try:
+        swept_row = query_one(
+            "WITH d AS (DELETE FROM seller_offers WHERE fetched_at < NOW() - INTERVAL '24 hours' RETURNING 1)"
+            " SELECT COUNT(*) AS n FROM d"
+        )
+        stale_swept = int((swept_row or {}).get("n") or 0)
+    except Exception as e:
+        print(f"[backfill] stale sweep skipped: {e}")
+        stale_swept = 0
+
     seeded = 0
     skipped = 0
     for r in rows:
@@ -431,9 +445,10 @@ async def backfill_sellers_from_snapshots(request: Request):
 
     return {
         "scanned": len(rows),
+        "stale_swept": stale_swept,
         "seeded": seeded,
         "skipped": skipped,
-        "message": f"Wrote {seeded} buy-box rows into seller_offers from latest snapshots",
+        "message": f"Swept {stale_swept} stale rows, wrote {seeded} fresh buy-box rows into seller_offers",
     }
 
 
