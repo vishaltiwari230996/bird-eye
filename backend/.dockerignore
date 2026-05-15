@@ -10,10 +10,6 @@ __pycache__/
 venv/
 env/
 
-# Playwright local browser cache (re-installed in Docker)
-.playwright/
-playwright-report/
-
 # Test / dev artifacts
 *.log
 *.sqlite

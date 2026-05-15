@@ -45,14 +45,14 @@ steps:
       - --region=$_REGION
       - --platform=managed
       - --allow-unauthenticated
-      - --min-instances=1          # keeps browser warm, avoids cold-start
+      - --min-instances=0          # cold starts still cheap; Chromium fits in 1 GiB
       - --max-instances=3
-      - --memory=2Gi               # Chromium needs ~800 MB; 2Gi gives headroom
+      - --memory=1Gi               # FastAPI + httpx + psycopg2 + Chromium (Snapshots panel)
       - --cpu=1
-      - --timeout=120              # 2-min request timeout for slow scrapes
-      - --concurrency=4            # limit concurrent scrapes per instance
+      - --timeout=1500             # snapshot cron can take ~15-20 min for 40 SKUs
+      - --concurrency=20
       - --set-env-vars=APP_ENV=production
-      - --set-secrets=DATABASE_URL=birdeye-db-url:latest,OPENROUTER_API_KEY=birdeye-openrouter-key:latest,CRON_SECRET=birdeye-cron-secret:latest,FRONTEND_URL=birdeye-frontend-url:latest
+      - --set-secrets=DATABASE_URL=birdeye-db-url:latest,OPENROUTER_API_KEY=birdeye-openrouter-key:latest,CRON_SECRET=birdeye-cron-secret:latest,BRIGHTDATA_TOKEN=birdeye-brightdata-token:latest,BRIGHTDATA_DATASET_ID=birdeye-brightdata-dataset:latest,BRIGHTDATA_SELLERS_DATASET_ID=birdeye-brightdata-sellers-dataset:latest,PROXY_URL=birdeye-proxy-url:latest,FRONTEND_URL=birdeye-frontend-url:latest
 
 images:
   - $_IMAGE:$SHORT_SHA

@@ -1,29 +1,33 @@
-"""main.py — Bird Eye FastAPI backend."""
-import asyncio
-import hashlib
+"""main.py — Bird Eye FastAPI backend.
+
+Single scraping path: BrightData via `pw_scraper`. The legacy Playwright /
+httpx / AI-extraction scraper has been retired — see `pw_scraper.py` for the
+new BrightData-only implementation and the discount % / MRP validation logic.
+"""
 import json
 import os
 import re
-import sys
 import time
 from datetime import datetime
 from typing import Any, Optional
-
-# Windows + Python 3.14 + Playwright requires the Proactor event loop for subprocesses.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 load_dotenv()
 
-from database import query, query_one, transaction
-from scraper import scrape_offer_listings, scrape_product, scrape_sellers_via_brightdata, scrape_via_brightdata
+from database import query, query_one  # noqa: E402
+from pw_scraper import (  # noqa: E402
+    ScrapedSku,
+    is_configured as brightdata_configured,
+    persist as persist_sku,
+    scrape_skus,
+)
+import snapshot_scraper  # noqa: E402
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -47,110 +51,6 @@ def map_interval(since: str) -> str:
         "1h": "1 hour", "6h": "6 hours", "24h": "24 hours",
         "7d": "7 days", "30d": "30 days", "all": "365 days",
     }.get(since, "24 hours")
-
-
-def hash_payload(payload: dict) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-
-
-# ─── Payload sanity validation ───────────────────────────────────────────────
-# Flags scraped payloads whose price/MRP/seller look implausible against the
-# previous snapshot. Suspect payloads are still saved (we want the history)
-# but are tagged with `needs_review=true` so they can be reviewed and the cron
-# monitor can attempt automatic reconciliation via Playwright. Tunable via
-# env vars; defaults are conservative.
-
-_PRICE_FLOOR = float(os.getenv("PRICE_SANITY_FLOOR", "20"))          # below this, almost certainly EMI/coupon leak
-_PRICE_JUMP_RATIO = float(os.getenv("PRICE_SANITY_JUMP_RATIO", "0.5"))  # >50% delta vs prev flags it
-_MRP_RATIO_CAP = float(os.getenv("MRP_SANITY_RATIO_CAP", "5"))       # MRP > 5x price is implausible
-
-
-def validate_payload(payload: dict, prev_payload: Optional[dict] = None) -> tuple[bool, list[str]]:
-    """Sanity-check a freshly scraped payload.
-
-    Returns (is_suspect, reasons). Catches:
-      - missing/zero price (scrape was blocked or Amazon returned a stub page)
-      - implausibly low prices (EMI / coupon / shipping leaked into price slot)
-      - large price swings vs the previous snapshot (variant swap, stale CDN)
-      - MRP grossly above price (banner-ad strike-through bleed)
-      - Kindle/digital seller on a non-Kindle title (format swap)
-    """
-    reasons: list[str] = []
-    price = _num(payload.get("price"))
-    mrp = _num(payload.get("mrp"))
-
-    # Price missing entirely is almost always Amazon blocking us and returning a
-    # captcha / stub HTML. Tag it so callers can decide whether to overwrite a
-    # known-good prior snapshot with this empty one (they usually shouldn't).
-    if payload.get("price") in (None, "", 0) or price <= 0:
-        reasons.append("price missing — scrape likely blocked")
-
-    if 0 < price < _PRICE_FLOOR:
-        reasons.append(f"price ₹{price} below floor ₹{_PRICE_FLOOR}")
-
-    if mrp > 0 and price > 0 and mrp > price * _MRP_RATIO_CAP:
-        reasons.append(f"mrp ₹{mrp} is >{_MRP_RATIO_CAP}× price ₹{price}")
-
-    if prev_payload:
-        prev_price = _num(prev_payload.get("price"))
-        if prev_price > 0 and price > 0:
-            ratio = abs(price - prev_price) / prev_price
-            if ratio >= _PRICE_JUMP_RATIO:
-                reasons.append(f"price jumped {ratio*100:.0f}% (₹{prev_price} → ₹{price})")
-
-    # Detect Kindle/digital seller swap on titles that don't look like Kindle SKUs.
-    title = (payload.get("title") or "").lower()
-    seller = ((payload.get("offers") or {}).get("seller") or "").lower()
-    if seller and "digital services" in seller and "kindle" not in title and "ebook" not in title:
-        reasons.append(f"seller looks like Kindle/digital ({seller}) but title isn't a Kindle SKU")
-
-    return (bool(reasons), reasons)
-
-
-def _upsert_buybox_seller_offer(pid: int, payload: dict) -> None:
-    """Mirror the freshly-scraped buy-box seller into the seller_offers table.
-
-    Why this exists: /api/sellers/refresh-all relies on Playwright (or PA-API
-    creds), and on Hugging Face Spaces Playwright frequently returns zero
-    listings (memory limits, no persistent browser binary, anti-bot blocks).
-    Every product-page scrape ALREADY knows the current buy-box seller and
-    price — we just weren't writing it anywhere. This function records that
-    snapshot into seller_offers so the PW Table's Cocoblu/Repro/PW columns
-    stay in sync with the buy-box automatically, without ever invoking the
-    fragile dedicated seller refresh.
-
-    Strategy:
-      • Sweep any rows for this product older than 24h (stale May-vintage
-        rows would otherwise drown out today's value when the frontend
-        takes min(price) per seller pattern).
-      • Sweep any prior row for the SAME seller on this product, so
-        repeated cron runs in the same day don't accumulate duplicates.
-      • Insert a fresh row for the buy-box seller. We don't blindly
-        delete every row for this product because a real multi-seller
-        refresh may have stored Cocoblu + Repro + PW concurrently — we
-        only want to refresh the row for the seller we just observed.
-    """
-    offers = payload.get("offers") or {}
-    seller = (offers.get("seller") or "").strip()
-    price = _num(payload.get("price"))
-    if not seller or price <= 0:
-        return
-    try:
-        query(
-            "DELETE FROM seller_offers WHERE product_id=$1 AND fetched_at < NOW() - INTERVAL '24 hours'",
-            [pid],
-        )
-        query(
-            "DELETE FROM seller_offers WHERE product_id=$1 AND seller_name=$2",
-            [pid, seller],
-        )
-        query(
-            "INSERT INTO seller_offers (product_id, seller_name, price, condition, is_fba, prime_eligible, fetched_at)"
-            " VALUES ($1,$2,$3,$4,$5,$6,NOW())",
-            [pid, seller, price, "New", False, False],
-        )
-    except Exception as e:
-        print(f"[upsert-seller] pid={pid} skipped: {e}")
 
 
 def parse_json_from_text(content: str) -> Any:
@@ -346,89 +246,11 @@ async def get_sellers(product_id: int):
     return rows
 
 
-@app.get("/api/sellers/debug-brightdata")
-async def debug_brightdata_response(request: Request, asin: str):
-    """Debug: fetch one product via BrightData and return the raw response keys.
-
-    Helps us decide whether BrightData's existing product dataset already
-    includes seller / offer-listing fields — in which case we can extract
-    them during the regular product scrape and skip configuring a separate
-    sellers dataset entirely.
-    """
-    cron_secret = os.getenv("CRON_SECRET", "")
-    auth = request.headers.get("authorization", "").replace("Bearer ", "")
-    if cron_secret and auth != cron_secret:
-        raise HTTPException(401, "Unauthorized")
-
-    token = os.environ.get("BRIGHTDATA_TOKEN", "").strip()
-    dataset_id = os.environ.get("BRIGHTDATA_DATASET_ID", "").strip()
-    if not token or not dataset_id:
-        return {"error": "BrightData not configured"}
-
-    url = f"https://www.amazon.in/dp/{asin}"
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                f"https://api.brightdata.com/datasets/v3/scrape"
-                f"?dataset_id={dataset_id}&notify=false&include_errors=true",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={"input": [{"url": url, "zipcode": "400001", "language": ""}]},
-            )
-            r.raise_for_status()
-            resp = r.json()
-    except Exception as e:
-        return {"error": f"BrightData call failed: {e}"}
-
-    # Async path — poll once briefly so we can see what comes back
-    if isinstance(resp, dict) and resp.get("snapshot_id"):
-        snapshot_id = resp["snapshot_id"]
-        async with httpx.AsyncClient(timeout=120) as client:
-            for _ in range(18):
-                await asyncio.sleep(5)
-                r = await client.get(
-                    f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                if r.status_code == 200 and isinstance(r.json(), list):
-                    resp = r.json()
-                    break
-                if r.status_code != 202:
-                    return {"error": f"poll {r.status_code}: {r.text[:200]}"}
-            else:
-                return {"error": "polling timed out"}
-
-    if not isinstance(resp, list) or not resp:
-        return {"raw_top_keys": list(resp.keys()) if isinstance(resp, dict) else None, "raw": str(resp)[:500]}
-
-    item = resp[0]
-    if not isinstance(item, dict):
-        return {"raw": str(item)[:500]}
-
-    # Pull out anything seller / offer related
-    seller_related = {}
-    for k, v in item.items():
-        kl = k.lower()
-        if any(needle in kl for needle in ("seller", "offer", "buy_box", "buybox", "merchant", "vendor")):
-            seller_related[k] = v if not isinstance(v, (list, dict)) else (str(v)[:400] + "..." if len(str(v)) > 400 else v)
-
-    return {
-        "all_keys": sorted(item.keys()),
-        "seller_offer_related_fields": seller_related,
-        "summary": (
-            f"BrightData returned {len(item.keys())} fields for {asin}. "
-            f"Found {len(seller_related)} seller/offer-related fields."
-        ),
-    }
-
-
 @app.get("/api/sellers/diagnose")
 async def diagnose_seller_sources():
-    """Report which seller-data sources are configured on this deployment.
+    """Report which BrightData datasets are configured.
 
-    Useful when troubleshooting why /api/sellers/refresh-all returns 0
-    listings — tells you at a glance whether the failure is "no source
-    configured" or "configured source isn't working". Never leaks
-    secrets; only reports yes/no flags and the suffix of any ID.
+    Never leaks secrets; only reports yes/no flags and the suffix of any ID.
     """
     def tail(v: str, n: int = 6) -> str:
         v = (v or "").strip()
@@ -437,241 +259,80 @@ async def diagnose_seller_sources():
     bd_token = os.environ.get("BRIGHTDATA_TOKEN", "").strip()
     bd_product = os.environ.get("BRIGHTDATA_DATASET_ID", "").strip()
     bd_sellers = os.environ.get("BRIGHTDATA_SELLERS_DATASET_ID", "").strip()
-    az_key    = os.environ.get("AMAZON_ACCESS_KEY", "").strip()
-    az_secret = os.environ.get("AMAZON_SECRET_KEY", "").strip()
-    az_tag    = os.environ.get("AMAZON_PARTNER_TAG", "").strip()
 
     return {
-        "paapi": {
-            "configured": bool(az_key and az_secret and az_tag),
-            "access_key_suffix": tail(az_key),
-            "partner_tag": az_tag or "(empty)",
-        },
-        "brightdata_sellers": {
-            "configured": bool(bd_token and bd_sellers),
-            "token_present": bool(bd_token),
-            "dataset_id_suffix": tail(bd_sellers),
-            "falls_back_to_product_dataset": bool(bd_token and not bd_sellers and bd_product),
-        },
-        "brightdata_product": {
+        "brightdata_token": bool(bd_token),
+        "brightdata_product_dataset": {
             "configured": bool(bd_token and bd_product),
             "dataset_id_suffix": tail(bd_product),
+            "captures": "title, price, MRP, buy-box seller (mirrored per SKU)",
         },
-        "playwright": {
-            "note": "Playwright always 'attempts' to run on this deployment but in practice "
-                    "returns 0 listings on Hugging Face Spaces due to browser/memory limits.",
-        },
-        "static_aod_ajax": {
-            "note": "Direct httpx fetch of Amazon's /gp/aod/ajax endpoint. Usually blocked from "
-                    "datacenter IPs (Hugging Face Spaces) — Amazon returns captcha/503.",
+        "brightdata_sellers_dataset": {
+            "configured": bool(bd_token and bd_sellers),
+            "dataset_id_suffix": tail(bd_sellers),
+            "captures": "every seller offer per ASIN (full seller landscape)",
         },
         "summary": (
-            "Configure BRIGHTDATA_SELLERS_DATASET_ID (cheapest, fastest) or PA-API credentials "
-            "(free, slower) to enable full multi-seller scraping. With neither, the only seller "
-            "data captured is the buy-box winner (mirrored from each product-page snapshot)."
+            "Without BRIGHTDATA_SELLERS_DATASET_ID the only seller data we record "
+            "is the buy-box winner. Set BRIGHTDATA_SELLERS_DATASET_ID to the "
+            "BrightData 'Amazon sellers info' dataset id to capture the full "
+            "seller landscape per ASIN."
         ),
     }
 
 
 @app.post("/api/products/{product_id}/sellers")
 async def refresh_sellers(product_id: int):
-    product = query_one("SELECT * FROM products WHERE id=$1", [product_id])
+    """Refresh a single PW SKU via BrightData (product + sellers + discount)."""
+    product = query_one(
+        "SELECT id, platform, asin_or_sku, url FROM products WHERE id=$1",
+        [product_id],
+    )
     if not product:
         raise HTTPException(404, "Product not found")
     if product["platform"] != "amazon":
         raise HTTPException(400, "Seller scraping is only supported for Amazon")
 
-    # Pass the last-known Buy Box price as an anchor so the AOD parser can
-    # tell the offer price apart from shipping/EMI/coupon snippets.
-    anchor_price: Optional[float] = None
-    last_snap = query_one(
-        "SELECT payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1",
-        [product_id],
-    )
-    if last_snap:
-        prev = last_snap["payload_json"]
-        if isinstance(prev, str):
-            try:
-                prev = json.loads(prev)
-            except Exception:
-                prev = None
-        if isinstance(prev, dict):
-            v = _num(prev.get("price"))
-            if v > 0:
-                anchor_price = v
-
-    listings = await scrape_offer_listings(product["asin_or_sku"], product_price=anchor_price)
-
-    if listings:
-        query("DELETE FROM seller_offers WHERE product_id=$1", [product_id])
-        for s in listings:
-            query(
-                "INSERT INTO seller_offers (product_id,seller_name,price,condition,is_fba,prime_eligible,fetched_at)"
-                " VALUES ($1,$2,$3,$4,$5,$6,NOW())",
-                [product_id, s["seller_name"], s["price"], s["condition"], s["is_fba"], s["prime_eligible"]],
-            )
-
-    return {"count": len(listings), "sellers": listings}
-
-
-@app.post("/api/sellers/backfill-from-snapshots")
-async def backfill_sellers_from_snapshots(request: Request):
-    """One-shot: mirror buy-box seller from latest snapshot into seller_offers.
-
-    Why: /api/sellers/refresh-all relies on Playwright, which is unreliable on
-    Hugging Face Spaces. But every product-page snapshot already carries the
-    current buy-box seller in payload.offers.seller. This endpoint walks the
-    most recent snapshot of every Amazon product and writes that seller into
-    the seller_offers table, so the PW Table's Cocoblu / Repro / PW columns
-    reflect today's reality without a single re-scrape.
-
-    Safe to run repeatedly. Existing rows older than 24h get swept; the fresh
-    buy-box row gets inserted with NOW() as fetched_at.
-    """
-    cron_secret = os.getenv("CRON_SECRET", "")
-    auth = request.headers.get("authorization", "").replace("Bearer ", "")
-    if cron_secret and auth != cron_secret:
-        raise HTTPException(401, "Unauthorized")
-
-    rows = query(
-        "SELECT DISTINCT ON (s.product_id) s.product_id, s.payload_json"
-        "  FROM snapshots s"
-        "  JOIN products p ON p.id = s.product_id"
-        " WHERE p.platform='amazon'"
-        " ORDER BY s.product_id, s.fetched_at DESC"
-    )
-
-    # Sweep ALL stale (>24h) rows up front, regardless of whether we'll have
-    # a fresh row to insert. Otherwise stale May-vintage rows would survive
-    # for products where the latest snapshot didn't manage to capture a seller
-    # name — and the frontend would still display them as if fresh.
-    try:
-        swept_row = query_one(
-            "WITH d AS (DELETE FROM seller_offers WHERE fetched_at < NOW() - INTERVAL '24 hours' RETURNING 1)"
-            " SELECT COUNT(*) AS n FROM d"
-        )
-        stale_swept = int((swept_row or {}).get("n") or 0)
-    except Exception as e:
-        print(f"[backfill] stale sweep skipped: {e}")
-        stale_swept = 0
-
-    seeded = 0
-    skipped = 0
-    for r in rows:
-        payload = r["payload_json"]
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = None
-        if not isinstance(payload, dict):
-            skipped += 1
-            continue
-        offers = payload.get("offers") or {}
-        seller = (offers.get("seller") or "").strip()
-        price = _num(payload.get("price"))
-        if not seller or price <= 0:
-            skipped += 1
-            continue
-        _upsert_buybox_seller_offer(r["product_id"], payload)
-        seeded += 1
-
-    return {
-        "scanned": len(rows),
-        "stale_swept": stale_swept,
-        "seeded": seeded,
-        "skipped": skipped,
-        "message": f"Swept {stale_swept} stale rows, wrote {seeded} fresh buy-box rows into seller_offers",
-    }
+    results = await scrape_skus([product])
+    if not results:
+        return {"status": "error", "message": "scraper returned no result"}
+    return persist_sku(results[0])
 
 
 @app.post("/api/sellers/refresh-all")
 async def refresh_all_sellers():
-    """SSE-streaming bulk seller refresh — PW own products only.
+    """SSE-streamed bulk refresh for PW-owned SKUs via BrightData.
 
-    Pass 1: BrightData batch (all ASINs in one API call — fast, no IP blocks).
-    Pass 2: Playwright fallback for any ASIN BrightData missed or returned empty.
+    Each result row is emitted as it lands. The browser progress bar in the
+    PW Table reads these events.
     """
     rows = query(
-        "SELECT id, asin_or_sku, url FROM products WHERE platform='amazon' AND is_own=true ORDER BY id"
+        "SELECT id, asin_or_sku, url FROM products"
+        " WHERE platform='amazon' AND is_own=true ORDER BY id"
     )
 
     async def generate():
         total = len(rows)
-        yield f"data: {json.dumps({'total': total, 'done': 0, 'started': True})}\n\n"
+        yield f"data: {json.dumps({'total': total, 'done': 0, 'started': True, 'configured': brightdata_configured()})}\n\n"
 
-        row_by_asin = {r["asin_or_sku"]: r for r in rows}
+        if not rows:
+            yield f"data: {json.dumps({'done': 0, 'total': 0, 'finished': True})}\n\n"
+            return
 
-        def _save_listings(product_id: int, listings: list[dict]) -> None:
-            query("DELETE FROM seller_offers WHERE product_id=$1", [product_id])
-            for s in listings:
-                query(
-                    "INSERT INTO seller_offers (product_id,seller_name,price,condition,is_fba,prime_eligible,fetched_at)"
-                    " VALUES ($1,$2,$3,$4,$5,$6,NOW())",
-                    [product_id, s["seller_name"], s["price"], s["condition"], s["is_fba"], s["prime_eligible"]],
-                )
+        results = await scrape_skus(list(rows))
+        done = 0
+        ok = 0
+        review = 0
+        for sku in results:
+            out = persist_sku(sku)
+            done += 1
+            if out.get("status") == "success":
+                ok += 1
+                if out.get("needsReview"):
+                    review += 1
+            yield f"data: {json.dumps({'done': done, 'total': total, **out})}\n\n"
 
-        # ── Pass 1: BrightData batch ─────────────────────────────────────────
-        asin_url_pairs = [{"asin": r["asin_or_sku"], "url": r["url"]} for r in rows]
-        bd_results = await scrape_sellers_via_brightdata(asin_url_pairs)
-        bd_done = 0
-        bd_succeeded: set[str] = set()
-
-        for asin, listings in bd_results.items():
-            row = row_by_asin.get(asin)
-            if not row:
-                continue
-            product_id = row["id"]
-            bd_done += 1
-            if listings:
-                _save_listings(product_id, listings)
-                bd_succeeded.add(asin)
-                yield f"data: {json.dumps({'done': bd_done, 'total': total, 'productId': product_id, 'asin': asin, 'count': len(listings), 'source': 'brightdata'})}\n\n"
-            else:
-                yield f"data: {json.dumps({'done': bd_done, 'total': total, 'productId': product_id, 'asin': asin, 'count': 0, 'source': 'brightdata', 'blocked': True})}\n\n"
-
-        # ── Pass 2: Playwright fallback for missed/empty ASINs ───────────────
-        playwright_rows = [r for r in rows if r["asin_or_sku"] not in bd_succeeded]
-        # If BrightData not configured, scrape everything via Playwright
-        if not bd_results:
-            playwright_rows = list(rows)
-
-        done_count = bd_done
-        # Pre-fetch last-known Buy Box prices once so we can anchor AOD parsing
-        # for every product in this pass without re-querying inside the loop.
-        anchor_rows = query(
-            "SELECT DISTINCT ON (product_id) product_id, payload_json"
-            " FROM snapshots WHERE product_id = ANY($1) ORDER BY product_id, fetched_at DESC",
-            [[r["id"] for r in playwright_rows]],
-        ) if playwright_rows else []
-        anchor_by_pid: dict[int, Optional[float]] = {}
-        for ar in anchor_rows:
-            payload = ar.get("payload_json")
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    payload = None
-            if isinstance(payload, dict):
-                v = _num(payload.get("price"))
-                if v > 0:
-                    anchor_by_pid[ar["product_id"]] = v
-
-        for i, row in enumerate(playwright_rows):
-            product_id, asin = row["id"], row["asin_or_sku"]
-            try:
-                listings = await scrape_offer_listings(asin, product_price=anchor_by_pid.get(product_id))
-                if listings:
-                    _save_listings(product_id, listings)
-                done_count += 1
-                yield f"data: {json.dumps({'done': done_count, 'total': total, 'productId': product_id, 'asin': asin, 'count': len(listings), 'source': 'playwright'})}\n\n"
-            except Exception as e:
-                done_count += 1
-                yield f"data: {json.dumps({'done': done_count, 'total': total, 'productId': product_id, 'asin': asin, 'count': 0, 'error': str(e), 'source': 'playwright'})}\n\n"
-            if i < len(playwright_rows) - 1:
-                await asyncio.sleep(1.5)
-
-        yield f"data: {json.dumps({'done': total, 'total': total, 'finished': True, 'brightdata_hits': len(bd_succeeded)})}\n\n"
+        yield f"data: {json.dumps({'done': total, 'total': total, 'finished': True, 'ok': ok, 'needs_review': review})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -811,9 +472,62 @@ class RunCheckBody(BaseModel):
 BATCH_SIZE = 10
 
 
+def _save_with_diff(sku: ScrapedSku) -> dict:
+    """Persist a scraped SKU and emit a `changes` row per detected diff.
+
+    Wraps `pw_scraper.persist` with the diff-engine logic that previously
+    lived inline in /api/run-check + /api/cron/monitor. Returns the persist
+    result plus the `changes` count so callers can report it.
+    """
+    last_snap = query_one(
+        "SELECT hash, payload_json FROM snapshots WHERE product_id=$1"
+        " ORDER BY fetched_at DESC LIMIT 1",
+        [sku.product_id],
+    )
+    prev_payload: Optional[dict] = None
+    prev_hash: Optional[str] = None
+    if last_snap:
+        prev_hash = last_snap.get("hash")
+        prev_payload = last_snap.get("payload_json")
+        if isinstance(prev_payload, str):
+            try:
+                prev_payload = json.loads(prev_payload)
+            except Exception:
+                prev_payload = None
+
+    if prev_payload and _num(prev_payload.get("price")) > 0 and (sku.price is None or sku.price <= 0):
+        print(f"[run-check] {sku.asin} SKIPPED — empty payload, prior good snapshot kept")
+        return {
+            "productId": sku.product_id,
+            "asin": sku.asin,
+            "status": "skipped_empty",
+            "changes": 0,
+            "needs_review": True,
+            "review_reasons": sku.review_reasons,
+        }
+
+    out = persist_sku(sku)
+    if out.get("status") != "success":
+        out["changes"] = 0
+        return out
+
+    # Diff against previous snapshot once the new one is saved.
+    change_count = 0
+    if prev_payload is not None:
+        new_payload = sku.to_snapshot_payload()
+        for fc in diff_payloads(prev_payload, new_payload):
+            query(
+                "INSERT INTO changes (product_id, field, old_value, new_value, detected_at)"
+                " VALUES ($1,$2,$3,$4,NOW())",
+                [sku.product_id, fc["field"], fc["old_value"], fc["new_value"]],
+            )
+            change_count += 1
+    out["changes"] = change_count
+    return out
+
+
 @app.post("/api/run-check")
 async def run_check(body: RunCheckBody, request: Request):
-    # Auth check
     cron_secret = os.getenv("CRON_SECRET", "")
     auth = request.headers.get("authorization", "").replace("Bearer ", "")
     host = request.headers.get("host", "localhost")
@@ -826,96 +540,27 @@ async def run_check(body: RunCheckBody, request: Request):
 
     if body.productId:
         products = query(
-            "SELECT id, platform, asin_or_sku, url, title_known FROM products WHERE id=$1",
+            "SELECT id, platform, asin_or_sku, url FROM products WHERE id=$1",
             [body.productId],
         )
     else:
         offset = body.batch * BATCH_SIZE
         products = query(
-            "SELECT id, platform, asin_or_sku, url, title_known FROM products ORDER BY id LIMIT $1 OFFSET $2",
+            "SELECT id, platform, asin_or_sku, url FROM products ORDER BY id LIMIT $1 OFFSET $2",
             [BATCH_SIZE, offset],
         )
 
     if not products:
         return {"message": "No products found", "batch": body.batch}
 
-    results = []
-    for product in products:
-        pid = product["id"]
-        asin = product["asin_or_sku"]
-        url = product["url"]
-        try:
-            payload = await scrape_product(asin, url)
-            if not payload:
-                results.append({"productId": pid, "status": "blocked", "changes": 0})
-                continue
-
-            last_snap = query_one(
-                "SELECT hash, payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1",
-                [pid],
-            )
-            prev_payload = None
-            if last_snap:
-                prev_payload = last_snap["payload_json"]
-                if isinstance(prev_payload, str):
-                    prev_payload = json.loads(prev_payload)
-
-            # Sanity-check; tag suspect payloads so downstream readers know
-            # not to trust them blindly. We still save them — silent dropping
-            # would hide drift; tagging makes it visible and auditable.
-            is_suspect, reasons = validate_payload(payload, prev_payload)
-
-            if _num(payload.get("price")) <= 0 and prev_payload and _num(prev_payload.get("price")) > 0:
-                print(f"[run-check] {asin} SKIPPED save — empty payload, prior good snapshot kept")
-                results.append({
-                    "productId": pid,
-                    "status": "skipped_empty",
-                    "changes": 0,
-                    "needs_review": True,
-                    "review_reasons": reasons,
-                })
-                continue
-
-            if is_suspect:
-                payload["needs_review"] = True
-                payload["review_reasons"] = reasons
-                payload["review_source"] = "scrape_product"
-                print(f"[run-check] {asin} flagged needs_review: {reasons}")
-
-            payload_json = json.dumps(payload)
-            h = hash_payload(payload)
-            query(
-                "INSERT INTO snapshots (product_id, payload_json, hash, fetched_at) VALUES ($1,$2::jsonb,$3,NOW())",
-                [pid, payload_json, h],
-            )
-            query("UPDATE products SET last_seen_at=NOW() WHERE id=$1", [pid])
-            _upsert_buybox_seller_offer(pid, payload)
-
-            # Diff
-            change_count = 0
-            if last_snap and last_snap["hash"] != h and prev_payload is not None:
-                field_changes = diff_payloads(prev_payload, payload)
-                for fc in field_changes:
-                    query(
-                        "INSERT INTO changes (product_id, field, old_value, new_value, detected_at) VALUES ($1,$2,$3,$4,NOW())",
-                        [pid, fc["field"], fc["old_value"], fc["new_value"]],
-                    )
-                change_count = len(field_changes)
-
-            results.append({
-                "productId": pid,
-                "status": "success",
-                "changes": change_count,
-                "needs_review": is_suspect,
-                "review_reasons": reasons if is_suspect else [],
-            })
-        except Exception as e:
-            results.append({"productId": pid, "status": "error", "changes": 0, "error": str(e)})
+    scraped = await scrape_skus(list(products))
+    results = [_save_with_diff(sku) for sku in scraped]
 
     return {
         "batch": body.batch,
         "processed": len(results),
-        "success": sum(1 for r in results if r["status"] == "success"),
+        "success": sum(1 for r in results if r.get("status") == "success"),
+        "needs_review": sum(1 for r in results if r.get("needs_review")),
         "results": results,
     }
 
@@ -1151,217 +796,209 @@ async def ai_battleground(request: Request):
     return parsed
 
 
+# ─── Snapshots panel ──────────────────────────────────────────────────────────
+#
+# The Snapshots panel shows hourly page-screenshots for ~20-40 PW SKUs. The
+# heavy lifting (Playwright + residential proxy + retries) lives in
+# ``snapshot_scraper.py`` — these endpoints are thin glue.
+
+def _snapshot_targets(limit: int) -> list[dict]:
+    """Resolve the SKUs the Snapshots panel should track.
+
+    Defaults to PW-owned Amazon SKUs (`is_own=true`), ordered by id, capped at
+    `limit`. This matches the curated card grid the team asked for and keeps
+    the hourly browser load to a predictable ceiling.
+    """
+    return list(query(
+        "SELECT id, asin_or_sku, url, title_known FROM products"
+        " WHERE platform='amazon' AND is_own=true"
+        " ORDER BY id LIMIT $1",
+        [limit],
+    ))
+
+
+@app.get("/api/snapshots")
+async def list_snapshots(limit: int = Query(40, ge=1, le=200)):
+    """Latest snapshot per tracked SKU (metadata only — images are served separately).
+
+    The image bytes column is intentionally excluded from the JSON payload so
+    the page load stays light. Use ``GET /api/snapshots/{product_id}/image``
+    to stream the JPEG with proper caching headers.
+    """
+    snapshot_scraper.ensure_table()
+    rows = query(
+        """SELECT p.id AS product_id, p.asin_or_sku, p.url, p.title_known,
+                  p.is_own, p.pool_id,
+                  ps.id AS snapshot_id, ps.title, ps.price, ps.mrp,
+                  ps.stock_status, ps.stock_message, ps.status, ps.error,
+                  ps.width, ps.height, ps.fetched_at,
+                  (octet_length(ps.image_bytes)) AS image_size
+             FROM products p
+             LEFT JOIN LATERAL (
+               SELECT * FROM page_snapshots
+                WHERE product_id=p.id AND status='ok'
+                ORDER BY fetched_at DESC LIMIT 1
+             ) ps ON TRUE
+            WHERE p.platform='amazon' AND p.is_own=true
+            ORDER BY p.id LIMIT $1""",
+        [limit],
+    )
+    return {"items": rows, "count": len(rows)}
+
+
+@app.get("/api/snapshots/{product_id}/image")
+async def get_snapshot_image(product_id: int):
+    """Serve the latest successful JPEG for a product."""
+    snapshot_scraper.ensure_table()
+    row = query_one(
+        "SELECT image_bytes, image_mime, fetched_at FROM page_snapshots"
+        " WHERE product_id=$1 AND status='ok'"
+        " ORDER BY fetched_at DESC LIMIT 1",
+        [product_id],
+    )
+    if not row or not row.get("image_bytes"):
+        raise HTTPException(404, "No snapshot yet for this product")
+    payload = bytes(row["image_bytes"])
+    return Response(
+        content=payload,
+        media_type=row.get("image_mime") or "image/jpeg",
+        headers={
+            # Short cache — UI polls latest; we don't want stale screenshots
+            # to outlive the hourly cron.
+            "Cache-Control": "public, max-age=60",
+            "X-Snapshot-Captured-At": (row.get("fetched_at") or datetime.utcnow()).isoformat()
+                if row.get("fetched_at") else "",
+        },
+    )
+
+
+@app.post("/api/snapshots/refresh/{product_id}")
+async def refresh_single_snapshot(product_id: int):
+    """Refresh one product's screenshot on demand (UI 'Refresh' button)."""
+    snapshot_scraper.ensure_table()
+    product = query_one(
+        "SELECT id, asin_or_sku, url, title_known FROM products"
+        " WHERE id=$1 AND platform='amazon'",
+        [product_id],
+    )
+    if not product:
+        raise HTTPException(404, "Product not found (or not Amazon)")
+    return await snapshot_scraper.refresh_one(product)
+
+
+@app.post("/api/snapshots/refresh-all")
+async def refresh_all_snapshots(limit: int = Query(40, ge=1, le=200)):
+    """SSE-streamed bulk refresh for the Snapshots panel."""
+    snapshot_scraper.ensure_table()
+    rows = _snapshot_targets(limit)
+
+    async def generate():
+        total = len(rows)
+        yield f"data: {json.dumps({'total': total, 'done': 0, 'started': True})}\n\n"
+        if not rows:
+            yield f"data: {json.dumps({'done': 0, 'total': 0, 'finished': True})}\n\n"
+            return
+
+        done = ok = err = 0
+        for product in rows:
+            try:
+                result = await snapshot_scraper.refresh_one(product)
+            except Exception as exc:  # noqa: BLE001
+                result = {"productId": product["id"], "asin": product.get("asin_or_sku"),
+                          "status": "error", "error": str(exc)}
+            done += 1
+            if result.get("status") == "ok":
+                ok += 1
+            else:
+                err += 1
+            yield f"data: {json.dumps({'done': done, 'total': total, **result})}\n\n"
+
+        yield f"data: {json.dumps({'done': total, 'total': total, 'finished': True, 'ok': ok, 'errors': err})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ─── Cron ─────────────────────────────────────────────────────────────────────
 
-@app.post("/api/cron/monitor")
-@app.get("/api/cron/monitor")
-async def cron_monitor(request: Request):
+@app.post("/api/cron/daily")
+@app.get("/api/cron/daily")
+async def cron_daily(request: Request):
+    """Consolidated daily refresh.
+
+    Replaces the old `/api/cron/monitor` + `/api/cron/sellers-refresh` pair.
+    One BrightData batch per dataset captures the product + seller landscape
+    for every Amazon SKU in the catalogue, with MRP/price/discount validated
+    by `pw_scraper.validate` before anything hits the database.
+
+    Auth: Bearer $CRON_SECRET.
+    """
     cron_secret = os.getenv("CRON_SECRET", "")
     auth = request.headers.get("authorization", "").replace("Bearer ", "")
     if cron_secret and auth != cron_secret:
         raise HTTPException(401, "Unauthorized")
-    products = query("SELECT id, platform, asin_or_sku, url FROM products ORDER BY id")
-    product_by_id = {p["id"]: p for p in products}
 
-    def _previous_snapshot(pid: int) -> tuple[Optional[str], Optional[dict]]:
-        row = query_one(
-            "SELECT hash, payload_json FROM snapshots WHERE product_id=$1 ORDER BY fetched_at DESC LIMIT 1",
-            [pid],
-        )
-        if not row:
-            return (None, None)
-        prev = row["payload_json"]
-        if isinstance(prev, str):
-            prev = json.loads(prev)
-        return (row["hash"], prev)
+    products = query(
+        "SELECT id, platform, asin_or_sku, url FROM products"
+        " WHERE platform = 'amazon' ORDER BY id"
+    )
+    if not products:
+        return {"processed": 0, "results": [], "message": "no products to scrape"}
 
-    def _save_payload(pid: int, payload: dict, source: str = "unknown") -> dict:
-        """Persist a snapshot and detect changes. Returns a result dict."""
-        prev_hash, prev_payload = _previous_snapshot(pid)
+    scraped = await scrape_skus(list(products))
+    results = [_save_with_diff(sku) for sku in scraped]
 
-        # Tag suspect payloads so downstream tooling (and the optional
-        # auto-reconciliation step below) can react. We still save the
-        # snapshot — silent dropping would hide genuine drift.
-        is_suspect, reasons = validate_payload(payload, prev_payload)
+    success = [r for r in results if r.get("status") == "success"]
+    needs_review = [r for r in results if r.get("needs_review")]
+    skipped = [r for r in results if r.get("status") == "skipped_empty"]
 
-        # Special case: if this scrape has no price at all but a previous
-        # good snapshot exists, refuse to overwrite. A blocked / captcha
-        # response would otherwise replace correct data with NULLs, which
-        # is what made the frontend show "wrong details" earlier.
-        if _num(payload.get("price")) <= 0 and prev_payload and _num(prev_payload.get("price")) > 0:
-            print(f"[cron] pid={pid} ({source}) SKIPPED save — empty payload, prior good snapshot kept")
-            return {
-                "productId": pid,
-                "status": "skipped_empty",
-                "changes": 0,
-                "needs_review": True,
-                "review_reasons": reasons,
-            }
-
-        if is_suspect:
-            payload["needs_review"] = True
-            payload["review_reasons"] = reasons
-            payload["review_source"] = source
-            print(f"[cron] pid={pid} ({source}) flagged needs_review: {reasons}")
-
-        h = hash_payload(payload)
-        query(
-            "INSERT INTO snapshots (product_id, payload_json, hash, fetched_at) VALUES ($1,$2::jsonb,$3,NOW())",
-            [pid, json.dumps(payload), h],
-        )
-        query("UPDATE products SET last_seen_at=NOW() WHERE id=$1", [pid])
-        _upsert_buybox_seller_offer(pid, payload)
-        change_count = 0
-        if prev_hash and prev_hash != h and prev_payload is not None:
-            for fc in diff_payloads(prev_payload, payload):
-                query(
-                    "INSERT INTO changes (product_id, field, old_value, new_value, detected_at) VALUES ($1,$2,$3,$4,NOW())",
-                    [pid, fc["field"], fc["old_value"], fc["new_value"]],
-                )
-                change_count += 1
-        return {
-            "productId": pid,
-            "status": "success",
-            "changes": change_count,
-            "needs_review": is_suspect,
-            "review_reasons": reasons if is_suspect else [],
-        }
-
-    async def _playwright_scrape_and_save(product: dict) -> dict:
-        """Fallback: scrape one product with Playwright and save."""
-        pid = product["id"]
-        try:
-            payload = await scrape_product(product["asin_or_sku"], product["url"])
-            if not payload:
-                return {"productId": pid, "status": "blocked"}
-            return _save_payload(pid, payload, source="playwright")
-        except Exception as e:
-            return {"productId": pid, "status": "error", "error": str(e)}
-
-    results: list[dict] = []
-
-    # ── Pass 1: BrightData batch (fast, structured, no IP blocks) ─────────
-    bd_results = await scrape_via_brightdata(list(products))
-    bd_succeeded: set[int] = set()
-    bd_suspect_pids: list[int] = []   # flagged by validate_payload — try Playwright as second opinion
-
-    for pid, payload in bd_results.items():
-        if payload:
-            try:
-                _, prev_payload = _previous_snapshot(pid)
-                is_suspect, _ = validate_payload(payload, prev_payload)
-                if is_suspect:
-                    # Don't save yet — re-scrape with Playwright and let the
-                    # cleaner of the two win. This is the main cross-source
-                    # reconciliation step that turns 1-in-10 wrong scrapes
-                    # into 1-in-50.
-                    bd_suspect_pids.append(pid)
-                    continue
-                r = _save_payload(pid, payload, source="brightdata")
-                r["source"] = "brightdata"
-                results.append(r)
-                bd_succeeded.add(pid)
-            except Exception as e:
-                results.append({"productId": pid, "status": "error", "error": str(e), "source": "brightdata"})
-        else:
-            results.append({"productId": pid, "status": "blocked", "source": "brightdata"})
-
-    # ── Pass 1b: Reconcile suspect BrightData payloads with Playwright ────
-    # For each suspect BrightData result we now have TWO candidate payloads
-    # available: the BrightData one (already in memory) and a fresh Playwright
-    # scrape. Pick whichever is *not* flagged by validate_payload. If both
-    # are flagged we still save the Playwright one (Playwright reads the live
-    # page, BrightData can serve cached snapshots up to a few hours old).
-    reconciled: list[dict] = []
-    for pid in bd_suspect_pids:
-        product = product_by_id.get(pid)
-        bd_payload = bd_results.get(pid)
-        if not product or not bd_payload:
-            continue
-        _, prev_payload = _previous_snapshot(pid)
-        try:
-            pw_payload = await scrape_product(product["asin_or_sku"], product["url"])
-        except Exception as e:
-            pw_payload = None
-            print(f"[cron] reconcile pid={pid}: playwright threw {e}")
-
-        pw_suspect = True
-        if pw_payload:
-            pw_suspect, _ = validate_payload(pw_payload, prev_payload)
-
-        # Choose the cleaner of the two. Playwright wins ties because it
-        # reads live HTML while BrightData can return cached records.
-        chosen, source = (pw_payload, "playwright-reconcile") if (pw_payload and not pw_suspect) else (bd_payload, "brightdata-reconcile")
-        if chosen is pw_payload and pw_payload is None:
-            chosen, source = bd_payload, "brightdata-reconcile"
-
-        try:
-            r = _save_payload(pid, chosen, source=source)
-            r["source"] = source
-            reconciled.append(r)
-            results.append(r)
-            bd_succeeded.add(pid)
-        except Exception as e:
-            results.append({"productId": pid, "status": "error", "error": str(e), "source": source})
-        await asyncio.sleep(0.3)
-
-    # Products BrightData didn't return at all (not even an error item)
-    bd_missing = [p for p in products if p["id"] not in bd_results]
-
-    # ── Pass 2: Playwright fallback for missed/failed SKUs ────────────────
-    playwright_needed = [
-        p for p in products
-        if p["id"] not in bd_succeeded
-    ] if not bd_missing and bd_results else bd_missing or list(products)
-
-    # If BrightData returned nothing at all (unconfigured), scrape everything
-    if not bd_results:
-        playwright_needed = list(products)
-        results = []  # will be populated below
-
-    for product in playwright_needed:
-        result = await _playwright_scrape_and_save(product)
-        result["source"] = "playwright"
-        # Replace any existing bd entry for this product
-        results = [r for r in results if r["productId"] != product["id"]]
-        results.append(result)
-        await asyncio.sleep(0.5)
-
-    # ── Pass 3: Retry only the SKUs still blocked/errored ─────────────────
-    MAX_RETRY_ATTEMPTS = 2
-    retry_results: list[dict] = []
-    failed = [r for r in results if r["status"] in ("blocked", "error")]
-
-    for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-        if not failed:
-            break
-        await asyncio.sleep(30 * attempt)
-        still_failed = []
-        for r in failed:
-            pid = r["productId"]
-            product = product_by_id.get(pid)
-            if not product:
-                continue
-            retry_r = await _playwright_scrape_and_save(product)
-            retry_r["attempt"] = attempt
-            retry_r["source"] = "playwright-retry"
-            retry_results.append(retry_r)
-            if retry_r["status"] in ("blocked", "error"):
-                still_failed.append(retry_r)
-            await asyncio.sleep(0.5)
-        failed = still_failed
-
-    needs_review_ids = [r["productId"] for r in results if r.get("needs_review")]
     return {
         "processed": len(results),
-        "brightdata_hits": len(bd_succeeded),
+        "success": len(success),
+        "skipped_empty": len(skipped),
+        "needs_review": [r["productId"] for r in needs_review],
+        "total_changes": sum(int(r.get("changes") or 0) for r in results),
+        "brightdata_configured": brightdata_configured(),
         "results": results,
-        "retry_attempts": MAX_RETRY_ATTEMPTS,
-        "retried": len(retry_results),
-        "retry_results": retry_results,
-        "still_failed": [r["productId"] for r in failed],
-        "reconciled": len(reconciled),
-        "needs_review": needs_review_ids,
+    }
+
+
+# Legacy alias — older cron jobs that still point at /api/cron/monitor keep working.
+@app.post("/api/cron/monitor")
+@app.get("/api/cron/monitor")
+async def cron_monitor_legacy(request: Request):
+    return await cron_daily(request)
+
+
+@app.post("/api/cron/snapshots")
+@app.get("/api/cron/snapshots")
+async def cron_snapshots(request: Request, limit: int = Query(40, ge=1, le=200)):
+    """Hourly page-screenshot refresh for the Snapshots panel.
+
+    Auth: Bearer $CRON_SECRET. Drives Playwright via the BrightData
+    residential proxy (PROXY_URL) so Amazon's bot wall stays friendly.
+    """
+    cron_secret = os.getenv("CRON_SECRET", "")
+    auth = request.headers.get("authorization", "").replace("Bearer ", "")
+    if cron_secret and auth != cron_secret:
+        raise HTTPException(401, "Unauthorized")
+
+    snapshot_scraper.ensure_table()
+    targets = _snapshot_targets(limit)
+    if not targets:
+        return {"processed": 0, "results": [], "message": "no snapshot targets configured"}
+
+    results = await snapshot_scraper.refresh_many(targets)
+    ok = [r for r in results if r.get("status") == "ok"]
+    errors = [r for r in results if r.get("status") != "ok"]
+    return {
+        "processed": len(results),
+        "ok": len(ok),
+        "errors": [{"asin": r.get("asin"), "error": r.get("error")} for r in errors],
+        "results": results,
     }
 
 

@@ -3,7 +3,7 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-# System packages needed to build psycopg2-binary and httpx[http2]
+# System packages needed to build psycopg2-binary.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -17,34 +17,28 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Playwright Chromium system dependencies (from playwright install-deps output)
+# libpq for psycopg2 + CA certs for HTTPS + Chromium runtime libs needed by
+# Playwright (the Snapshots panel). The size hit lives only on this image, not
+# on cron-only deployments that don't take screenshots.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Chromium core
-    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-    libxrandr2 libgbm1 libasound2 libpangocairo-1.0-0 libpango-1.0-0 \
-    libcairo2 libatspi2.0-0 libwayland-client0 \
-    # Font rendering (avoids missing-font bot signals)
-    fonts-liberation fonts-noto-color-emoji \
-    # Misc
-    wget ca-certificates \
+    libpq5 ca-certificates \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages from builder
 COPY --from=builder /install /usr/local
 
-# Install Playwright browsers (Chromium only — ~170 MB)
-RUN playwright install chromium
+# Install Chromium for Playwright. Cached separately so app code changes
+# don't invalidate this big layer.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN python -m playwright install chromium
 
-# Copy application code
 COPY . .
 
-# HuggingFace / Cloud Run inject PORT; default to 8080
+# HuggingFace / Cloud Run inject PORT; default to 8080.
 ENV PORT=8080
 ENV APP_ENV=production
-
-# Chromium path inside the Playwright cache (set so scraper can find it)
-# Playwright manages the path itself; we only override CHROME_PATH if needed.
 
 EXPOSE 8080
 

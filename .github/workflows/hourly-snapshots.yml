@@ -1,0 +1,49 @@
+name: Hourly Snapshots refresh
+
+# Drives the Snapshots panel — fires every hour, hits /api/cron/snapshots which
+# uses Playwright (via PROXY_URL) to take fresh page screenshots for the
+# ~20-40 PW SKUs and stores them in Postgres.
+
+on:
+  schedule:
+    # Every hour, on the hour.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max SKUs to refresh (default 40)"
+        required: false
+        default: "40"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger snapshots cron
+        env:
+          API_URL: https://moonshinemadara-myspace.hf.space
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          LIMIT: ${{ github.event.inputs.limit || '40' }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET secret is not set in this repo"
+            exit 1
+          fi
+          echo "Calling $API_URL/api/cron/snapshots?limit=$LIMIT ..."
+          # Cap at 25 minutes — well under GitHub Actions' 6h job limit but
+          # long enough for 40 SKUs * ~20-30s each on the residential proxy.
+          curl -sS --max-time 1500 -X POST "$API_URL/api/cron/snapshots?limit=$LIMIT" \
+               -H "Authorization: Bearer $CRON_SECRET" \
+               -H "Accept: application/json" \
+            | tee snapshots.log
+          echo
+          echo "=== Snapshots refresh finished ==="
+          tail -n 20 snapshots.log
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshots-log
+          path: snapshots.log
+          if-no-files-found: ignore

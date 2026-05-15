@@ -1,16 +1,21 @@
-name: Daily seller refresh
+name: Daily PW catalogue refresh
+
+# One consolidated daily job. Calls /api/cron/daily, which uses BrightData to
+# refresh every Amazon SKU's snapshot (title, price, MRP, buy-box seller) and
+# rewrite seller_offers (when BRIGHTDATA_SELLERS_DATASET_ID is configured).
 
 on:
   schedule:
-    # Runs every day at 02:00 UTC (07:30 IST)
+    # 02:00 UTC = 07:30 IST. Before business hours so the team sees fresh
+    # numbers when they open the dashboard.
     - cron: "0 2 * * *"
-  workflow_dispatch:  # also allow manual run from the Actions tab
+  workflow_dispatch:
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger seller refresh on HF Space
+      - name: Trigger daily refresh
         env:
           API_URL: https://moonshinemadara-myspace.hf.space
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
@@ -19,13 +24,20 @@ jobs:
             echo "::error::CRON_SECRET secret is not set in this repo"
             exit 1
           fi
-          echo "Calling $API_URL/api/sellers/refresh-all ..."
-          # Stream the SSE response; cap at 30 minutes so a stuck call doesn't hang the job.
-          curl -sS --max-time 1800 -N \
-               -X POST "$API_URL/api/sellers/refresh-all" \
+          echo "Calling $API_URL/api/cron/daily ..."
+          # Cap at 30 minutes so a stuck call doesn't hang the job.
+          curl -sS --max-time 1800 -X POST "$API_URL/api/cron/daily" \
                -H "Authorization: Bearer $CRON_SECRET" \
-               -H "Accept: text/event-stream" \
+               -H "Accept: application/json" \
             | tee refresh.log
           echo
           echo "=== Refresh finished ==="
-          tail -n 5 refresh.log
+          tail -n 10 refresh.log
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refresh-log
+          path: refresh.log
+          if-no-files-found: ignore

@@ -1,4 +1,4 @@
-import { Link, NavLink } from 'react-router-dom';
+import { NavLink } from 'react-router-dom';
 import { type ReactNode } from 'react';
 
 const MARQUEE_ITEMS = [
@@ -43,7 +43,7 @@ export default function Layout({ children }: { children: ReactNode }) {
       <MarqueeBand />
       <header className="site-header">
         <div className="max-w-[1400px] mx-auto px-10 py-5 flex items-center justify-between gap-6">
-          <Link to="/" className="flex items-center gap-3 no-underline">
+          <NavLink to="/pw-table" className="flex items-center gap-3 no-underline">
             <span className="brand-mark" aria-hidden>
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
                 <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.4" />
@@ -52,13 +52,11 @@ export default function Layout({ children }: { children: ReactNode }) {
             </span>
             <span className="serif text-[22px]" style={{ color: 'var(--ink)' }}>Bird Eye</span>
             <span className="kicker hidden sm:inline">PW Observatory</span>
-          </Link>
+          </NavLink>
 
           <nav className="flex items-center gap-2">
-            <NavLink to="/" end className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>Products</NavLink>
             <NavLink to="/pw-table" className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>PW Table</NavLink>
-            <NavLink to="/cohorts" className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>Cohorts</NavLink>
-            <NavLink to="/report" className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>Report</NavLink>
+            <NavLink to="/snapshots" className={({ isActive }) => `nav-tab ${isActive ? 'active' : ''}`}>Snapshots</NavLink>
           </nav>
 
           <div className="flex items-center gap-3">

@@ -40,7 +40,7 @@ from psycopg2.extras import execute_values  # noqa: E402
 
 from database import get_pool, query, query_one  # noqa: E402
 
-DEFAULT_XLSX = Path(r"D:/birdeye/Bird_Eyes_06052026.xlsx")
+DEFAULT_XLSX = Path(__file__).resolve().parent.parent / "Bird_Eyes_06052026.xlsx"
 POOL_NAME = "PW Catalogue"
 PLATFORM = "amazon"
 

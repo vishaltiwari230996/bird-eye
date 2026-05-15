@@ -2,28 +2,14 @@ node_modules/
 .next/
 .env
 .env.local
-.vercel
 .env*.local
+.vercel/
 
 __pycache__/
 *.pyc
 dist/
-node_modules/
 
-# Local debug / scratch artifacts
-backend/_inspect.py
-backend/_inspect_*.py
-backend/_pick_*.py
-backend/check_sellers.py
-backend/inspect_olp.py
-backend/debug_*.html
-backend/debug_*.txt
-backend/dbg_*.html
-Use_Eye_Tools.xlsx
-Bird_Eyes_*.xlsx
-
-# Scraping logs (large, noisy, may contain URLs/ASINs)
+# Scraping logs (may contain URLs/ASINs)
 *.log
 logs/
-scrape_pw_run*.log
-bulk_scrape.log
+backend/run_logs/
